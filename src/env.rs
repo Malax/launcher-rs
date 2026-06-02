@@ -27,7 +27,7 @@ pub const LAUNCH_ENV_EXCLUDELIST: &[&str] = &[
 /// Encapsulates the execution environment variables and layer-sourcing modifications for the launch process.
 pub struct LaunchEnv {
     vars: HashMap<String, String>,
-    root_dir_map: HashMap<String, Vec<String>>,
+    root_dir_map: HashMap<String, String>,
 }
 
 impl LaunchEnv {
@@ -45,7 +45,7 @@ impl LaunchEnv {
         }
 
         // Sanitize PATH
-        if let Some(path_val) = vars.get("PATH") {
+        if let Some(path_val) = vars.get("PATH").cloned() {
             let parts = std::env::split_paths(&path_val);
             let mut stripped = Vec::new();
             for part in parts {
@@ -60,8 +60,8 @@ impl LaunchEnv {
         }
 
         let mut root_dir_map = HashMap::new();
-        root_dir_map.insert("bin".to_string(), vec!["PATH".to_string()]);
-        root_dir_map.insert("lib".to_string(), vec!["LD_LIBRARY_PATH".to_string()]);
+        root_dir_map.insert("bin".to_string(), "PATH".to_string());
+        root_dir_map.insert("lib".to_string(), "LD_LIBRARY_PATH".to_string());
 
         LaunchEnv { vars, root_dir_map }
     }
@@ -81,22 +81,20 @@ impl LaunchEnv {
         let abs_dir = fs::canonicalize(layer_dir)
             .map_err(|e| format!("Canonicalize layer dir '{}': {}", layer_dir, e))?;
 
-        for (sub_dir, vars) in &self.root_dir_map {
+        for (sub_dir, var_name) in &self.root_dir_map {
             let child_dir = abs_dir.join(sub_dir);
             if child_dir.is_dir() {
                 let child_str = child_dir.to_string_lossy().into_owned();
-                for var_name in vars {
-                    let current = self.vars.get(var_name).cloned().unwrap_or_default();
-                    if current.is_empty() {
-                        self.vars.insert(var_name.clone(), child_str.clone());
-                    } else {
-                        // Prepend layer path using standard PATH separator
-                        let mut paths = vec![PathBuf::from(&child_str)];
-                        paths.extend(std::env::split_paths(&current));
-                        if let Ok(new_path) = std::env::join_paths(paths) {
-                            self.vars
-                                .insert(var_name.clone(), new_path.to_string_lossy().into_owned());
-                        }
+                let current = self.vars.get(var_name).cloned().unwrap_or_default();
+                if current.is_empty() {
+                    self.vars.insert(var_name.clone(), child_str.clone());
+                } else {
+                    // Prepend layer path using standard PATH separator
+                    let mut paths = vec![PathBuf::from(&child_str)];
+                    paths.extend(std::env::split_paths(&current));
+                    if let Ok(new_path) = std::env::join_paths(paths) {
+                        self.vars
+                            .insert(var_name.clone(), new_path.to_string_lossy().into_owned());
                     }
                 }
             }
