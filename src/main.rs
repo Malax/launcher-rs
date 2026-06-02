@@ -1,0 +1,576 @@
+pub mod api;
+pub mod env;
+pub mod exec_d;
+pub mod exit;
+pub mod launch;
+pub mod shell;
+
+use env::{ActionType, LaunchEnv};
+use exit::ExitCode;
+use launch::{RawMetadata, ResolvedProcess, resolve_process};
+use shell::{BashShell, Shell, ShellProcess};
+use std::fs;
+use std::path::Path;
+
+const DEFAULT_PLATFORM_API: &str = ""; // match Go's empty default
+const DEFAULT_LAYERS_DIR: &str = "/layers";
+const DEFAULT_APP_DIR: &str = "/workspace";
+const DEFAULT_EXEC_ENV: &str = "production";
+
+fn should_enable_color() -> bool {
+    if let Ok(no_color) = std::env::var("CNB_NO_COLOR") {
+        if no_color.trim().to_lowercase() == "true" {
+            return false;
+        }
+    }
+    unsafe { libc::isatty(2) == 1 }
+}
+
+fn format_error(msg: &str, enable_color: bool) -> String {
+    if enable_color {
+        format!("\x1b[31;1mERROR: \x1b[0m{}", msg)
+    } else {
+        format!("ERROR: {}", msg)
+    }
+}
+
+fn format_warning(msg: &str, enable_color: bool) -> String {
+    if enable_color {
+        format!("\x1b[33;1mWarning: \x1b[0m{}", msg)
+    } else {
+        format!("Warning: {}", msg)
+    }
+}
+
+fn print_error(msg: &str) {
+    eprintln!("{}", format_error(msg, should_enable_color()));
+}
+
+fn print_warning(msg: &str) {
+    eprintln!("{}", format_warning(msg, should_enable_color()));
+}
+
+fn main() {
+    if let Err(e) = run_launcher() {
+        let msg = if e.message.starts_with("failed to ") {
+            e.message.clone()
+        } else {
+            format!("failed to {}", e.message)
+        };
+        print_error(&msg);
+        std::process::exit(e.code.as_i32());
+    }
+}
+
+#[derive(Debug)]
+struct LaunchError {
+    message: String,
+    code: ExitCode,
+}
+
+impl LaunchError {
+    fn new(msg: String, code: ExitCode) -> Self {
+        LaunchError { message: msg, code }
+    }
+}
+
+fn run_launcher() -> Result<(), LaunchError> {
+    // 1. Parse and verify Platform API
+    let platform_api_str =
+        std::env::var("CNB_PLATFORM_API").unwrap_or_else(|_| DEFAULT_PLATFORM_API.to_string());
+
+    let platform_api = api::platform::verify_platform_api(&platform_api_str).map_err(|e| {
+        let msg = match e {
+            api::platform::PlatformApiError::Empty => {
+                "get platform API version; please set 'CNB_PLATFORM_API' to specify the desired platform API version".to_string()
+            }
+            api::platform::PlatformApiError::Invalid(val) => {
+                format!("parse platform API '{}'", val)
+            }
+            api::platform::PlatformApiError::Incompatible(val) => {
+                format!("set platform API: platform API version '{}' is incompatible with the lifecycle", val)
+            }
+        };
+        LaunchError::new(
+            msg,
+            ExitCode::PlatformApiIncompatible,
+        )
+    })?;
+
+    // 2. Parse Layers, App directories, and Exec Env
+    let layers_dir =
+        std::env::var("CNB_LAYERS_DIR").unwrap_or_else(|_| DEFAULT_LAYERS_DIR.to_string());
+    let app_dir = std::env::var("CNB_APP_DIR").unwrap_or_else(|_| DEFAULT_APP_DIR.to_string());
+    let exec_env = std::env::var("CNB_EXEC_ENV").unwrap_or_else(|_| DEFAULT_EXEC_ENV.to_string());
+
+    // 3. Read metadata.toml
+    let metadata_path = Path::new(&layers_dir).join("config").join("metadata.toml");
+    if !metadata_path.is_file() {
+        return Err(LaunchError::new(
+            format!(
+                "read metadata: metadata file not found at '{}'",
+                metadata_path.display()
+            ),
+            ExitCode::LaunchError,
+        ));
+    }
+
+    let metadata_content = fs::read_to_string(&metadata_path)
+        .map_err(|e| LaunchError::new(format!("read metadata: {}", e), ExitCode::LaunchError))?;
+
+    let metadata: RawMetadata = toml::from_str(&metadata_content).map_err(|e| {
+        LaunchError::new(
+            format!("read metadata: parse failed: {}", e),
+            ExitCode::LaunchError,
+        )
+    })?;
+
+    // 4. Verify each buildpack's API
+    for bp in &metadata.buildpacks {
+        api::buildpack::verify_buildpack_api(&bp.id, &bp.api).map_err(|e| {
+            LaunchError::new(
+                format!("set API for buildpack '{}': {}", bp.id, e),
+                ExitCode::BuildpackApiIncompatible,
+            )
+        })?;
+    }
+
+    // 5. Gather CLI Arguments
+    let args: Vec<String> = std::env::args().collect();
+    let user_args = if args.len() > 1 {
+        args[1..].to_vec()
+    } else {
+        Vec::new()
+    };
+
+    // 6. Determine process type based on argv[0]
+    let argv0 = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "launcher".to_string());
+    let argv0_file_name = Path::new(&argv0)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "launcher".to_string());
+
+    // Default exec extension stripping (like .exe on windows, empty on unix)
+    let process_name = if cfg!(windows) {
+        argv0_file_name
+            .strip_suffix(".exe")
+            .unwrap_or(&argv0_file_name)
+            .to_string()
+    } else {
+        argv0_file_name
+    };
+
+    let mut default_process_type = String::new();
+    if process_name != "launcher" {
+        // If argv0 is not "launcher", check if it matches a buildpack process type
+        if metadata
+            .processes
+            .iter()
+            .any(|p| p.proc_type == process_name)
+        {
+            default_process_type = process_name;
+        }
+    }
+
+    // If default process type is not resolved from argv0, check CNB_PROCESS_TYPE for warnings
+    if default_process_type.is_empty() {
+        if let Ok(p_type) = std::env::var("CNB_PROCESS_TYPE") {
+            if !p_type.trim().is_empty() {
+                print_warning(&format!(
+                    "CNB_PROCESS_TYPE is not supported in Platform API {}",
+                    platform_api
+                ));
+                print_warning(&format!(
+                    "Run with ENTRYPOINT '{}' to invoke the '{}' process type",
+                    p_type, p_type
+                ));
+            }
+        }
+    }
+
+    // 7. Resolve target process
+    let resolved_process = if !default_process_type.is_empty() {
+        // Find raw process matching default_process_type
+        let raw_proc = metadata
+            .processes
+            .iter()
+            .find(|p| p.proc_type == default_process_type)
+            .ok_or_else(|| {
+                LaunchError::new(
+                    format!("process type '{}' was not found", default_process_type),
+                    ExitCode::LaunchError,
+                )
+            })?;
+
+        resolve_process(
+            raw_proc,
+            &metadata.buildpacks,
+            &platform_api,
+            &exec_env,
+            &user_args,
+        )
+        .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?
+        .ok_or_else(|| {
+            LaunchError::new(
+                format!(
+                    "process type '{}' is not eligible for execution environment '{}'",
+                    default_process_type, exec_env
+                ),
+                ExitCode::LaunchError,
+            )
+        })?
+    } else {
+        // If argv0 was launcher, then user args determine the target
+        if user_args.is_empty() {
+            // Find default process in metadata
+            if let Some(raw_proc) = metadata.processes.iter().find(|p| p.default) {
+                resolve_process(
+                    raw_proc,
+                    &metadata.buildpacks,
+                    &platform_api,
+                    &exec_env,
+                    &[],
+                )
+                .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?
+                .ok_or_else(|| {
+                    LaunchError::new(
+                        "Default process is not eligible for execution environment".to_string(),
+                        ExitCode::LaunchError,
+                    )
+                })?
+            } else {
+                return Err(LaunchError::new(
+                    "determine start command: when there is no default process a command is required".to_string(),
+                    ExitCode::LaunchError,
+                ));
+            }
+        } else {
+            // If the first argument matches a process type (legacy fallback or platform behavior check)
+            if let Some(raw_proc) = metadata
+                .processes
+                .iter()
+                .find(|p| p.proc_type == user_args[0])
+            {
+                resolve_process(
+                    raw_proc,
+                    &metadata.buildpacks,
+                    &platform_api,
+                    &exec_env,
+                    &user_args[1..],
+                )
+                .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?
+                .ok_or_else(|| {
+                    LaunchError::new(
+                        format!("Process type '{}' is not eligible", user_args[0]),
+                        ExitCode::LaunchError,
+                    )
+                })?
+            } else {
+                // Parse user-provided custom command
+                ResolvedProcess::user_provided(&user_args, &app_dir)
+                    .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?
+            }
+        }
+    };
+
+    // 8. Prepare Launch Environment
+    let host_envs: Vec<(String, String)> = std::env::vars().collect();
+    let process_dir = "/cnb/process";
+    let lifecycle_dir = "/cnb/lifecycle";
+
+    let mut env = LaunchEnv::new(&host_envs, process_dir, lifecycle_dir);
+
+    // Apply layers sequential modifications
+    for bp in &metadata.buildpacks {
+        let bp_dir = Path::new(&layers_dir).join(escape_id(&bp.id));
+        if !bp_dir.is_dir() {
+            continue;
+        }
+
+        // List and sort layer subdirectories alphabetically ascending
+        let entries = fs::read_dir(&bp_dir).map_err(|e| {
+            LaunchError::new(
+                format!("List layers for buildpack '{}': {}", bp.id, e),
+                ExitCode::LaunchError,
+            )
+        })?;
+
+        let mut layer_dirs = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| LaunchError::new(e.to_string(), ExitCode::LaunchError))?;
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                layer_dirs.push(entry.path());
+            }
+        }
+        layer_dirs.sort();
+
+        // 1. Add layer roots to path variables
+        for ldir in &layer_dirs {
+            env.add_root_dir(&ldir.to_string_lossy())
+                .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?;
+        }
+
+        // 2. Add env file modifications
+        for ldir in &layer_dirs {
+            let ldir_str = ldir.to_string_lossy();
+
+            // Apply <layer>/env
+            env.add_env_dir(&format!("{}/env", ldir_str), ActionType::Override)
+                .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?;
+
+            // Apply <layer>/env.launch
+            env.add_env_dir(&format!("{}/env.launch", ldir_str), ActionType::Override)
+                .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?;
+
+            // Apply <layer>/env.launch/<process>
+            if !resolved_process.proc_type.is_empty() {
+                env.add_env_dir(
+                    &format!("{}/env.launch/{}", ldir_str, resolved_process.proc_type),
+                    ActionType::Override,
+                )
+                .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?;
+            }
+        }
+    }
+
+    // 9. Run exec.d scripts sequentially
+    for bp in &metadata.buildpacks {
+        let bp_dir = Path::new(&layers_dir).join(escape_id(&bp.id));
+        if !bp_dir.is_dir() {
+            continue;
+        }
+
+        let entries = fs::read_dir(&bp_dir).map_err(|e| {
+            LaunchError::new(format!("List layers for exec.d: {}", e), ExitCode::LaunchError)
+        })?;
+
+        let mut layer_dirs = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|e| LaunchError::new(e.to_string(), ExitCode::LaunchError))?;
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                layer_dirs.push(entry.path());
+            }
+        }
+        layer_dirs.sort();
+
+        for ldir in &layer_dirs {
+            let exec_d_dir = ldir.join("exec.d");
+            if exec_d_dir.is_dir() {
+                run_exec_d_in_dir(&exec_d_dir, &mut env)?;
+            }
+
+            if !resolved_process.proc_type.is_empty() {
+                let proc_exec_d_dir = exec_d_dir.join(&resolved_process.proc_type);
+                if proc_exec_d_dir.is_dir() {
+                    run_exec_d_in_dir(&proc_exec_d_dir, &mut env)?;
+                }
+            }
+        }
+    }
+
+    // 10. Execute decided process strategy
+    if resolved_process.direct {
+        // Direct execution (Shell-Free!)
+        if let Err(err) = resolved_process.launch_direct(&env) {
+            return Err(LaunchError::new(
+                format!("direct exec: {}", err),
+                ExitCode::LaunchError,
+            ));
+        }
+        Ok(())
+    } else {
+        // Indirect execution (Invokes Bash with sourced profiles)
+        let mut profiles = Vec::new();
+
+        // Accumulate buildpack layer profiles in order
+        for bp in &metadata.buildpacks {
+            let bp_dir = Path::new(&layers_dir).join(escape_id(&bp.id));
+            if !bp_dir.is_dir() {
+                continue;
+            }
+
+            let entries = fs::read_dir(&bp_dir).map_err(|e| {
+                LaunchError::new(
+                    format!("List layers for profile.d: {}", e),
+                    ExitCode::LaunchError,
+                )
+            })?;
+
+            let mut layer_dirs = Vec::new();
+            for entry in entries {
+                let entry =
+                    entry.map_err(|e| LaunchError::new(e.to_string(), ExitCode::LaunchError))?;
+                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    layer_dirs.push(entry.path());
+                }
+            }
+            layer_dirs.sort();
+
+            for ldir in &layer_dirs {
+                let profile_d_dir = ldir.join("profile.d");
+                if profile_d_dir.is_dir() {
+                    accumulate_files_in_dir(&profile_d_dir, &mut profiles)?;
+                }
+
+                if !resolved_process.proc_type.is_empty() {
+                    let proc_profile_d_dir = profile_d_dir.join(&resolved_process.proc_type);
+                    if proc_profile_d_dir.is_dir() {
+                        accumulate_files_in_dir(&proc_profile_d_dir, &mut profiles)?;
+                    }
+                }
+            }
+        }
+
+        // Add app .profile if it exists and is not a directory
+        let app_profile_path = Path::new(&app_dir).join(".profile");
+        if app_profile_path.is_file() {
+            profiles.push(app_profile_path.to_string_lossy().into_owned());
+        }
+
+        let shell_proc = ShellProcess {
+            script: resolved_process.args.is_empty(), // Script is true if no user args
+            command: resolved_process.command.clone(),
+            args: resolved_process.args.clone(),
+            caller: argv0,
+            profiles,
+            env: env.vars().clone(),
+            working_directory: resolved_process.working_directory.clone(),
+        };
+
+        let bash_shell = BashShell;
+        if let Err(err) = bash_shell.launch(shell_proc) {
+            return Err(LaunchError::new(
+                format!("bash exec: {}", err),
+                ExitCode::LaunchError,
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn escape_id(id: &str) -> String {
+    id.replace('/', "_")
+}
+
+fn run_exec_d_in_dir(dir: &Path, env: &mut LaunchEnv) -> Result<(), LaunchError> {
+    let entries = fs::read_dir(dir)
+        .map_err(|e| LaunchError::new(format!("List exec.d dir: {}", e), ExitCode::LaunchError))?;
+
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| LaunchError::new(e.to_string(), ExitCode::LaunchError))?;
+        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+
+    for file in files {
+        let file_str = file.to_string_lossy();
+        let res = exec_d::run_exec_d(&file_str, env)
+            .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?;
+        for (k, v) in res {
+            env.set(&k, &v);
+        }
+    }
+    Ok(())
+}
+
+fn accumulate_files_in_dir(dir: &Path, list: &mut Vec<String>) -> Result<(), LaunchError> {
+    let entries = fs::read_dir(dir)
+        .map_err(|e| LaunchError::new(format!("List profile.d dir: {}", e), ExitCode::LaunchError))?;
+
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| LaunchError::new(e.to_string(), ExitCode::LaunchError))?;
+        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            files.push(entry.path());
+        }
+    }
+    files.sort();
+
+    for file in files {
+        list.push(file.to_string_lossy().into_owned());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+
+    #[test]
+    fn test_format_error_output() {
+        // Test non-colorized formatting
+        assert_eq!(format_error("my error", false), "ERROR: my error");
+
+        // Test colorized formatting (Bold Red sequence)
+        assert_eq!(
+            format_error("my error", true),
+            "\x1b[31;1mERROR: \x1b[0mmy error"
+        );
+    }
+
+    #[test]
+    fn test_format_warning_output() {
+        // Test non-colorized formatting
+        assert_eq!(format_warning("my warning", false), "Warning: my warning");
+
+        // Test colorized formatting (Bold Yellow sequence)
+        assert_eq!(
+            format_warning("my warning", true),
+            "\x1b[33;1mWarning: \x1b[0mmy warning"
+        );
+    }
+
+    #[test]
+    fn test_should_enable_color_respects_env() {
+        // Force color disabling via CNB_NO_COLOR
+        unsafe {
+            std::env::set_var("CNB_NO_COLOR", "true");
+        }
+        assert!(
+            !should_enable_color(),
+            "CNB_NO_COLOR=true must disable color"
+        );
+
+        // Remove the environment variable to restore default state
+        unsafe {
+            std::env::remove_var("CNB_NO_COLOR");
+        }
+    }
+
+    #[test]
+    fn test_escape_id() {
+        assert_eq!(escape_id("heroku/ruby"), "heroku_ruby");
+        assert_eq!(escape_id("no-slash"), "no-slash");
+        assert_eq!(escape_id("multiple/slashes/here"), "multiple_slashes_here");
+    }
+
+    #[test]
+    fn test_accumulate_files_in_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path();
+
+        // Create some files out of order
+        let file_b = path.join("b.sh");
+        let file_a = path.join("a.sh");
+        let file_c = path.join("c.sh");
+
+        fs::write(&file_b, "echo b").unwrap();
+        fs::write(&file_a, "echo a").unwrap();
+        fs::write(&file_c, "echo c").unwrap();
+
+        let mut list = Vec::new();
+        accumulate_files_in_dir(path, &mut list).unwrap();
+
+        // Should be sorted alphabetically
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0], file_a.to_string_lossy().into_owned());
+        assert_eq!(list[1], file_b.to_string_lossy().into_owned());
+        assert_eq!(list[2], file_c.to_string_lossy().into_owned());
+    }
+}
