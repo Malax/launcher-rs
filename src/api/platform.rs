@@ -7,8 +7,6 @@ pub const SUPPORTED_PLATFORM_APIS: &[&str] = &[
 
 pub const DEPRECATED_PLATFORM_APIS: &[&str] = &[];
 
-
-
 pub fn is_supported(requested: &Version) -> bool {
     SUPPORTED_PLATFORM_APIS.iter().any(|&sup| {
         if let Ok(sup_ver) = Version::from_str(sup) {
@@ -41,7 +39,11 @@ impl std::fmt::Display for PlatformApiError {
         match self {
             PlatformApiError::Empty => write!(f, "Platform API version is empty"),
             PlatformApiError::Invalid(v) => write!(f, "parse platform API '{}'", v),
-            PlatformApiError::Incompatible(v) => write!(f, "platform API version '{}' is incompatible with the lifecycle", v),
+            PlatformApiError::Incompatible(v) => write!(
+                f,
+                "platform API version '{}' is incompatible with the lifecycle",
+                v
+            ),
         }
     }
 }
@@ -52,8 +54,8 @@ pub fn verify_platform_api(requested_str: &str) -> Result<Version, PlatformApiEr
         return Err(PlatformApiError::Empty);
     }
 
-    let requested = Version::from_str(clean)
-        .map_err(|_| PlatformApiError::Invalid(clean.to_string()))?;
+    let requested =
+        Version::from_str(clean).map_err(|_| PlatformApiError::Invalid(clean.to_string()))?;
 
     if is_supported(&requested) {
         if is_deprecated(&requested) {
@@ -74,9 +76,14 @@ mod tests {
     fn test_platform_api_verification() {
         assert!(verify_platform_api("0.15").is_ok());
         assert!(verify_platform_api("0.7").is_ok());
-        assert_eq!(verify_platform_api("0.6"), Err(PlatformApiError::Incompatible("0.6".to_string())));
-        assert_eq!(verify_platform_api("bad-api"), Err(PlatformApiError::Invalid("bad-api".to_string())));
+        assert_eq!(
+            verify_platform_api("0.6"),
+            Err(PlatformApiError::Incompatible("0.6".to_string()))
+        );
+        assert_eq!(
+            verify_platform_api("bad-api"),
+            Err(PlatformApiError::Invalid("bad-api".to_string()))
+        );
         assert_eq!(verify_platform_api(""), Err(PlatformApiError::Empty));
     }
 }
-

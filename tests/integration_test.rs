@@ -64,7 +64,10 @@ echo 'INJECTED_VAR = "injected_exec_d"' >&3
 
     // 3. Locate compiled launcher binary
     let launcher_bin = Path::new("target/debug/launcher").canonicalize();
-    assert!(launcher_bin.is_ok(), "Launcher binary not found at target/debug/launcher. Please run cargo build first.");
+    assert!(
+        launcher_bin.is_ok(),
+        "Launcher binary not found at target/debug/launcher. Please run cargo build first."
+    );
     let launcher_bin = launcher_bin.unwrap();
 
     // 4. Spawn the launcher
@@ -80,14 +83,30 @@ echo 'INJECTED_VAR = "injected_exec_d"' >&3
 
     let output = cmd.output().unwrap();
 
-    assert!(output.status.success(), "Launcher failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "Launcher failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout_str = String::from_utf8_lossy(&output.stdout);
-    
+
     // 5. Assertions on final environment!
-    assert!(stdout_str.contains("FOO=bar"), "Missing FOO=bar in final env. Stdout: {}", stdout_str);
-    assert!(stdout_str.contains("VAR=base-suffix"), "Missing VAR=base-suffix in final env. Stdout: {}", stdout_str);
-    assert!(stdout_str.contains("INJECTED_VAR=injected_exec_d"), "Missing INJECTED_VAR in final env. Stdout: {}", stdout_str);
+    assert!(
+        stdout_str.contains("FOO=bar"),
+        "Missing FOO=bar in final env. Stdout: {}",
+        stdout_str
+    );
+    assert!(
+        stdout_str.contains("VAR=base-suffix"),
+        "Missing VAR=base-suffix in final env. Stdout: {}",
+        stdout_str
+    );
+    assert!(
+        stdout_str.contains("INJECTED_VAR=injected_exec_d"),
+        "Missing INJECTED_VAR in final env. Stdout: {}",
+        stdout_str
+    );
 }
 
 #[test]
@@ -97,13 +116,21 @@ fn test_integration_platform_api_incompatible() {
 
     let mut cmd = Command::new(&launcher_bin);
     cmd.env("CNB_PLATFORM_API", "0.5"); // Unsupported API version
-    cmd.env("CNB_LAYERS_DIR", layers_temp.path().to_string_lossy().to_string());
+    cmd.env(
+        "CNB_LAYERS_DIR",
+        layers_temp.path().to_string_lossy().to_string(),
+    );
 
     let output = cmd.output().unwrap();
-    assert_eq!(output.status.code().unwrap(), 11, "Expected exit code 11 for platform incompatibility");
+    assert_eq!(
+        output.status.code().unwrap(),
+        11,
+        "Expected exit code 11 for platform incompatibility"
+    );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("incompatible with the lifecycle"),
-        "Unexpected error: {}", String::from_utf8_lossy(&output.stderr)
+        "Unexpected error: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -136,10 +163,15 @@ api = "0.5" # Unsupported Buildpack API version
     cmd.env("CNB_LAYERS_DIR", layers_path.to_string_lossy().to_string());
 
     let output = cmd.output().unwrap();
-    assert_eq!(output.status.code().unwrap(), 12, "Expected exit code 12 for buildpack incompatibility");
+    assert_eq!(
+        output.status.code().unwrap(),
+        12,
+        "Expected exit code 12 for buildpack incompatibility"
+    );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("incompatible with the lifecycle"),
-        "Unexpected error: {}", String::from_utf8_lossy(&output.stderr)
+        "Unexpected error: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -172,10 +204,16 @@ api = "0.12"
     cmd.env("CNB_LAYERS_DIR", layers_path.to_string_lossy().to_string());
 
     let output = cmd.output().unwrap();
-    assert_eq!(output.status.code().unwrap(), 82, "Expected exit code 82 for generic launch error");
+    assert_eq!(
+        output.status.code().unwrap(),
+        82,
+        "Expected exit code 82 for generic launch error"
+    );
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("when there is no default process a command is required"),
-        "Unexpected error: {}", String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&output.stderr)
+            .contains("when there is no default process a command is required"),
+        "Unexpected error: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 
@@ -224,12 +262,17 @@ api = "0.12"
     cmd.env("CNB_EXEC_ENV", "production");
 
     let output = cmd.output().unwrap();
-    assert!(output.status.success(), "Launcher failed: {}", String::from_utf8_lossy(&output.stderr));
-    
+    assert!(
+        output.status.success(),
+        "Launcher failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
     let stdout_str = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout_str.contains("sourced-bp-val sourced-app-val"),
-        "Missing sourced env values from profiles! Stdout: {}", stdout_str
+        "Missing sourced env values from profiles! Stdout: {}",
+        stdout_str
     );
 }
 
@@ -241,11 +284,18 @@ fn test_integration_platform_api_unset() {
     let mut cmd = Command::new(&launcher_bin);
     // Explicitly remove CNB_PLATFORM_API to test the unset default behavior
     cmd.env_remove("CNB_PLATFORM_API");
-    cmd.env("CNB_LAYERS_DIR", layers_temp.path().to_string_lossy().to_string());
+    cmd.env(
+        "CNB_LAYERS_DIR",
+        layers_temp.path().to_string_lossy().to_string(),
+    );
 
     let output = cmd.output().unwrap();
-    assert_eq!(output.status.code().unwrap(), 11, "Expected exit code 11 for unset platform API");
-    
+    assert_eq!(
+        output.status.code().unwrap(),
+        11,
+        "Expected exit code 11 for unset platform API"
+    );
+
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("failed to get platform API version; please set 'CNB_PLATFORM_API' to specify the desired platform API version"),
@@ -260,11 +310,18 @@ fn test_integration_platform_api_empty() {
 
     let mut cmd = Command::new(&launcher_bin);
     cmd.env("CNB_PLATFORM_API", "");
-    cmd.env("CNB_LAYERS_DIR", layers_temp.path().to_string_lossy().to_string());
+    cmd.env(
+        "CNB_LAYERS_DIR",
+        layers_temp.path().to_string_lossy().to_string(),
+    );
 
     let output = cmd.output().unwrap();
-    assert_eq!(output.status.code().unwrap(), 11, "Expected exit code 11 for empty platform API");
-    
+    assert_eq!(
+        output.status.code().unwrap(),
+        11,
+        "Expected exit code 11 for empty platform API"
+    );
+
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("failed to get platform API version; please set 'CNB_PLATFORM_API' to specify the desired platform API version"),
@@ -279,15 +336,22 @@ fn test_integration_platform_api_invalid() {
 
     let mut cmd = Command::new(&launcher_bin);
     cmd.env("CNB_PLATFORM_API", "bad-api-version");
-    cmd.env("CNB_LAYERS_DIR", layers_temp.path().to_string_lossy().to_string());
+    cmd.env(
+        "CNB_LAYERS_DIR",
+        layers_temp.path().to_string_lossy().to_string(),
+    );
 
     let output = cmd.output().unwrap();
-    assert_eq!(output.status.code().unwrap(), 11, "Expected exit code 11 for invalid platform API");
-    
+    assert_eq!(
+        output.status.code().unwrap(),
+        11,
+        "Expected exit code 11 for invalid platform API"
+    );
+
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("failed to parse platform API 'bad-api-version'"),
-        "Unexpected error output: {}", stderr
+        "Unexpected error output: {}",
+        stderr
     );
 }
-

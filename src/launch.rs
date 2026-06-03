@@ -89,22 +89,40 @@ impl std::fmt::Display for ProcessSelectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ProcessSelectionError::NoCommandAndNoDefault => {
-                write!(f, "determine start command: when there is no default process a command is required")
+                write!(
+                    f,
+                    "determine start command: when there is no default process a command is required"
+                )
             }
             ProcessSelectionError::IneligibleProcess { name, exec_env } => {
-                write!(f, "process type '{}' is not eligible for execution environment '{}'", name, exec_env)
+                write!(
+                    f,
+                    "process type '{}' is not eligible for execution environment '{}'",
+                    name, exec_env
+                )
             }
             ProcessSelectionError::IneligibleDefault => {
-                write!(f, "Default process is not eligible for execution environment")
+                write!(
+                    f,
+                    "Default process is not eligible for execution environment"
+                )
             }
             ProcessSelectionError::IneligibleProcessSimple { name } => {
                 write!(f, "Process type '{}' is not eligible", name)
             }
             ProcessSelectionError::BuildpackNotFound { bp_id, proc_type } => {
-                write!(f, "Buildpack '{}' not found in metadata for process '{}'", bp_id, proc_type)
+                write!(
+                    f,
+                    "Buildpack '{}' not found in metadata for process '{}'",
+                    bp_id, proc_type
+                )
             }
             ProcessSelectionError::EmptyCommand { proc_type } => {
-                write!(f, "Command entries list is empty for process '{}'", proc_type)
+                write!(
+                    f,
+                    "Command entries list is empty for process '{}'",
+                    proc_type
+                )
             }
             ProcessSelectionError::BuildpackApi(err) => {
                 write!(f, "{}", err)
@@ -264,11 +282,9 @@ impl<'a> ProcessSelector<'a> {
                     self.exec_env,
                     &user_args,
                 )?
-                .ok_or_else(|| {
-                    ProcessSelectionError::IneligibleProcess {
-                        name: process_name.clone(),
-                        exec_env: self.exec_env.to_string(),
-                    }
+                .ok_or_else(|| ProcessSelectionError::IneligibleProcess {
+                    name: process_name.clone(),
+                    exec_env: self.exec_env.to_string(),
                 });
             }
         }
@@ -283,9 +299,7 @@ impl<'a> ProcessSelector<'a> {
                     self.exec_env,
                     &[],
                 )?
-                .ok_or_else(|| {
-                    ProcessSelectionError::IneligibleDefault
-                });
+                .ok_or_else(|| ProcessSelectionError::IneligibleDefault);
             }
             return Err(ProcessSelectionError::NoCommandAndNoDefault);
         }
@@ -340,11 +354,9 @@ pub fn resolve_process(
         let bp = buildpacks
             .iter()
             .find(|bp| bp.id == raw.buildpack_id)
-            .ok_or_else(|| {
-                ProcessSelectionError::BuildpackNotFound {
-                    bp_id: raw.buildpack_id.clone(),
-                    proc_type: raw.proc_type.clone(),
-                }
+            .ok_or_else(|| ProcessSelectionError::BuildpackNotFound {
+                bp_id: raw.buildpack_id.clone(),
+                proc_type: raw.proc_type.clone(),
             })?;
         Some(crate::api::buildpack::verify_buildpack_api(
             &bp.id, &bp.api,

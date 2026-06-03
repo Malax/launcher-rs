@@ -20,7 +20,7 @@ impl Version {
     }
 
     /// Determines if this version is a superset of (backwards-compatible with) another `Version`.
-    /// 
+    ///
     /// According to the Cloud Native Buildpacks specification:
     /// - For major version 0, they must be exactly equal (strict backwards-incompatible 0.x phase).
     /// - For major version >= 1, they must have the same major version and this minor >= other minor.
@@ -91,17 +91,39 @@ mod tests {
 
     #[test]
     fn test_version_parsing() {
-        assert_eq!(Version::from_str("0.7").unwrap(), Version { major: 0, minor: 7 });
-        assert_eq!(Version::from_str("v0.7").unwrap(), Version { major: 0, minor: 7 });
-        assert_eq!(Version::from_str("1.12").unwrap(), Version { major: 1, minor: 12 });
-        assert_eq!(Version::from_str("2").unwrap(), Version { major: 2, minor: 0 });
+        assert_eq!(
+            Version::from_str("0.7").unwrap(),
+            Version { major: 0, minor: 7 }
+        );
+        assert_eq!(
+            Version::from_str("v0.7").unwrap(),
+            Version { major: 0, minor: 7 }
+        );
+        assert_eq!(
+            Version::from_str("1.12").unwrap(),
+            Version {
+                major: 1,
+                minor: 12
+            }
+        );
+        assert_eq!(
+            Version::from_str("2").unwrap(),
+            Version { major: 2, minor: 0 }
+        );
         assert!(Version::from_str("").is_err());
         assert!(Version::from_str("abc").is_err());
     }
 
     #[test]
     fn test_version_display() {
-        assert_eq!(Version { major: 0, minor: 15 }.to_string(), "0.15");
+        assert_eq!(
+            Version {
+                major: 0,
+                minor: 15
+            }
+            .to_string(),
+            "0.15"
+        );
         assert_eq!(Version { major: 1, minor: 0 }.to_string(), "1.0");
     }
 
@@ -126,7 +148,10 @@ mod tests {
 
     #[test]
     fn test_less_than_and_at_least() {
-        let v0_10 = Version { major: 0, minor: 10 };
+        let v0_10 = Version {
+            major: 0,
+            minor: 10,
+        };
         assert!(v0_10.less_than("0.11"));
         assert!(!v0_10.less_than("0.9"));
         assert!(v0_10.at_least("0.10"));

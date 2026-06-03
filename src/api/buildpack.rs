@@ -1,13 +1,9 @@
 use super::Version;
 use std::str::FromStr;
 
-pub const SUPPORTED_BUILDPACK_APIS: &[&str] = &[
-    "0.7", "0.8", "0.9", "0.10", "0.11", "0.12",
-];
+pub const SUPPORTED_BUILDPACK_APIS: &[&str] = &["0.7", "0.8", "0.9", "0.10", "0.11", "0.12"];
 
 pub const DEPRECATED_BUILDPACK_APIS: &[&str] = &[];
-
-
 
 pub fn is_supported(requested: &Version) -> bool {
     SUPPORTED_BUILDPACK_APIS.iter().any(|&sup| {
@@ -31,18 +27,37 @@ pub fn is_deprecated(requested: &Version) -> bool {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum BuildpackApiError {
-    Parse { bp_id: String, version: String, error: String },
-    Incompatible { bp_id: String, version: String },
+    Parse {
+        bp_id: String,
+        version: String,
+        error: String,
+    },
+    Incompatible {
+        bp_id: String,
+        version: String,
+    },
 }
 
 impl std::fmt::Display for BuildpackApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BuildpackApiError::Parse { bp_id, version, error } => {
-                write!(f, "Parse buildpack API '{}' for buildpack '{}': {}", version, bp_id, error)
+            BuildpackApiError::Parse {
+                bp_id,
+                version,
+                error,
+            } => {
+                write!(
+                    f,
+                    "Parse buildpack API '{}' for buildpack '{}': {}",
+                    version, bp_id, error
+                )
             }
             BuildpackApiError::Incompatible { bp_id, version } => {
-                write!(f, "buildpack API version '{}' is incompatible with the lifecycle for buildpack '{}'", version, bp_id)
+                write!(
+                    f,
+                    "buildpack API version '{}' is incompatible with the lifecycle for buildpack '{}'",
+                    version, bp_id
+                )
             }
         }
     }
@@ -50,7 +65,10 @@ impl std::fmt::Display for BuildpackApiError {
 
 impl std::error::Error for BuildpackApiError {}
 
-pub fn verify_buildpack_api(bp_id: &str, requested_str: &str) -> Result<Version, BuildpackApiError> {
+pub fn verify_buildpack_api(
+    bp_id: &str,
+    requested_str: &str,
+) -> Result<Version, BuildpackApiError> {
     let clean = requested_str.trim();
     let requested = Version::from_str(clean).map_err(|e| BuildpackApiError::Parse {
         bp_id: bp_id.to_string(),

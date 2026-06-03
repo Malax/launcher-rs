@@ -117,11 +117,10 @@ impl LaunchEnv {
 
     /// Appends a root layer path to standard PATH and LD_LIBRARY_PATH variables.
     pub fn add_root_dir(&mut self, layer_dir: &str) -> Result<(), LaunchEnvError> {
-        let abs_dir = fs::canonicalize(layer_dir)
-            .map_err(|e| LaunchEnvError::Canonicalize {
-                path: layer_dir.to_string(),
-                error: e,
-            })?;
+        let abs_dir = fs::canonicalize(layer_dir).map_err(|e| LaunchEnvError::Canonicalize {
+            path: layer_dir.to_string(),
+            error: e,
+        })?;
 
         for (sub_dir, var_name) in &self.root_dir_map {
             let child_dir = abs_dir.join(sub_dir);
@@ -145,7 +144,11 @@ impl LaunchEnv {
     }
 
     /// Processes a directory containing environment files and applies them sequentially.
-    pub fn add_env_dir(&mut self, env_dir: &str, default_action: ActionType) -> Result<(), LaunchEnvError> {
+    pub fn add_env_dir(
+        &mut self,
+        env_dir: &str,
+        default_action: ActionType,
+    ) -> Result<(), LaunchEnvError> {
         let path = Path::new(env_dir);
         if !path.is_dir() {
             return Ok(());
@@ -164,7 +167,7 @@ impl LaunchEnv {
                         return Some(Err(LaunchEnvError::ListDir {
                             path: env_dir.to_string(),
                             error: err,
-                        }))
+                        }));
                     }
                 };
                 match fs::metadata(entry.path()) {
@@ -208,7 +211,13 @@ impl LaunchEnv {
         &self.vars
     }
 
-    fn evaluate_env_modifier(&self, name: &str, action: ActionType, v: String, delim: Option<&str>) -> Option<String> {
+    fn evaluate_env_modifier(
+        &self,
+        name: &str,
+        action: ActionType,
+        v: String,
+        delim: Option<&str>,
+    ) -> Option<String> {
         let current = self.vars.get(name).cloned().unwrap_or_default();
         match action {
             ActionType::Override => Some(v),
@@ -247,7 +256,10 @@ impl LaunchEnv {
     }
 }
 
-fn parse_env_file_parts(file_name: &str, default_action: ActionType) -> Option<(String, ActionType)> {
+fn parse_env_file_parts(
+    file_name: &str,
+    default_action: ActionType,
+) -> Option<(String, ActionType)> {
     let parts: Vec<&str> = file_name.splitn(2, '.').collect();
     let name = parts[0].to_string();
     let suffix = if parts.len() > 1 { parts[1] } else { "" };
@@ -345,7 +357,7 @@ mod tests {
 
     #[test]
     fn test_parse_env_file_parts() {
-        use super::{parse_env_file_parts, ActionType};
+        use super::{ActionType, parse_env_file_parts};
 
         // Valid suffixes
         assert_eq!(
@@ -393,7 +405,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_env_modifier() {
-        use super::{LaunchEnv, ActionType};
+        use super::{ActionType, LaunchEnv};
 
         let env = LaunchEnv::new(&[], "", "");
 
@@ -414,7 +426,12 @@ mod tests {
         let mut env_with_val = LaunchEnv::new(&[], "", "");
         env_with_val.set("BAR", "val1");
         assert_eq!(
-            env_with_val.evaluate_env_modifier("BAR", ActionType::Default, "val2".to_string(), None),
+            env_with_val.evaluate_env_modifier(
+                "BAR",
+                ActionType::Default,
+                "val2".to_string(),
+                None
+            ),
             None
         );
 
@@ -426,16 +443,30 @@ mod tests {
 
         // 4. Append with custom delimiter
         assert_eq!(
-            env_with_val.evaluate_env_modifier("BAR", ActionType::Append, "val3".to_string(), Some("-")),
+            env_with_val.evaluate_env_modifier(
+                "BAR",
+                ActionType::Append,
+                "val3".to_string(),
+                Some("-")
+            ),
             Some("val1-val3".to_string())
         );
 
         // 5. Prepend path variable (uses default separator)
         let mut env_with_path = LaunchEnv::new(&[], "", "");
         env_with_path.set("PATH", "/usr/bin");
-        let expected = if cfg!(windows) { "/bin;/usr/bin" } else { "/bin:/usr/bin" };
+        let expected = if cfg!(windows) {
+            "/bin;/usr/bin"
+        } else {
+            "/bin:/usr/bin"
+        };
         assert_eq!(
-            env_with_path.evaluate_env_modifier("PATH", ActionType::Prepend, "/bin".to_string(), None),
+            env_with_path.evaluate_env_modifier(
+                "PATH",
+                ActionType::Prepend,
+                "/bin".to_string(),
+                None
+            ),
             Some(expected.to_string())
         );
     }
