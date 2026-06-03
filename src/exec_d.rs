@@ -4,24 +4,19 @@ use std::fs::File;
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::FromRawFd;
+use std::os::unix::io::IntoRawFd;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 /// Executes the executable at the given path, capturing environment variables written to File Descriptor 3.
 /// The executable should implement the exec.d interface, writing TOML key-value pairs to FD 3.
 pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>, String> {
-    let mut fds = [0; 2];
-    unsafe {
-        if libc::pipe(fds.as_mut_ptr()) == -1 {
-            return Err(format!(
-                "Failed to create OS pipe: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-    }
+    let (reader_fd, writer_fd) =
+        rustix::pipe::pipe().map_err(|e| format!("Failed to create OS pipe: {}", e))?;
 
-    let reader = unsafe { File::from_raw_fd(fds[0]) };
-    let writer = unsafe { File::from_raw_fd(fds[1]) };
+    let reader: File = reader_fd.into();
+    let writer: File = writer_fd.into();
+
     let writer_fd = writer.as_raw_fd();
 
     let mut cmd = Command::new(path);
@@ -30,9 +25,21 @@ pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>
     unsafe {
         cmd.pre_exec(move || {
             // Duplicate the write end of the pipe to File Descriptor 3 in the child process
-            if libc::dup2(writer_fd, 3) == -1 {
-                return Err(std::io::Error::last_os_error());
+            let borrowed_writer = std::os::unix::io::BorrowedFd::borrow_raw(writer_fd);
+
+            // We construct an OwnedFd for FD 3, which dup2 requires as the target.
+            // This is unsafe because we are claiming ownership of FD 3, which is fine
+            // since we are in the child process and about to either overwrite it or fail.
+            let mut target = std::os::unix::io::OwnedFd::from_raw_fd(3);
+
+            if let Err(e) = rustix::io::dup2(borrowed_writer, &mut target) {
+                // Leak target so it doesn't try to close an invalid FD on error
+                let _ = target.into_raw_fd();
+                return Err(e.into());
             }
+
+            // Leak target so FD 3 stays open for the exec'd process!
+            let _ = target.into_raw_fd();
             Ok(())
         });
     }

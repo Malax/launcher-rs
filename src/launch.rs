@@ -104,9 +104,7 @@ impl ResolvedProcess {
     /// Launches a process directly (without a shell) using Unix process replacement.
     pub fn launch_direct(&self, env: &LaunchEnv) -> Result<(), std::io::Error> {
         let path_val = env.get("PATH").cloned().unwrap_or_default();
-        unsafe {
-            std::env::set_var("PATH", &path_val);
-        }
+
 
         // Find the absolute path to the command
         let binary_path = which::which_in(&self.command, Some(&path_val), &std::env::current_dir()?)

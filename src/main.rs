@@ -10,6 +10,7 @@ use exit::ExitCode;
 use launch::{RawMetadata, ResolvedProcess, resolve_process};
 use shell::{BashShell, Shell, ShellProcess};
 use std::fs;
+use std::io::IsTerminal;
 use std::path::Path;
 
 const DEFAULT_PLATFORM_API: &str = ""; // match Go's empty default
@@ -23,7 +24,7 @@ fn should_enable_color() -> bool {
             return false;
         }
     }
-    unsafe { libc::isatty(2) == 1 }
+    std::io::stderr().is_terminal()
 }
 
 fn format_error(msg: &str, enable_color: bool) -> String {
