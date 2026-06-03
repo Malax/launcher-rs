@@ -116,9 +116,10 @@ impl LaunchEnv {
     }
 
     /// Appends a root layer path to standard PATH and LD_LIBRARY_PATH variables.
-    pub fn add_root_dir(&mut self, layer_dir: &str) -> Result<(), LaunchEnvError> {
+    pub fn add_root_dir<P: AsRef<Path>>(&mut self, layer_dir: P) -> Result<(), LaunchEnvError> {
+        let layer_dir = layer_dir.as_ref();
         let abs_dir = fs::canonicalize(layer_dir).map_err(|e| LaunchEnvError::Canonicalize {
-            path: layer_dir.to_string(),
+            path: layer_dir.to_string_lossy().into_owned(),
             error: e,
         })?;
 
@@ -144,18 +145,18 @@ impl LaunchEnv {
     }
 
     /// Processes a directory containing environment files and applies them sequentially.
-    pub fn add_env_dir(
+    pub fn add_env_dir<P: AsRef<Path>>(
         &mut self,
-        env_dir: &str,
+        env_dir: P,
         default_action: ActionType,
     ) -> Result<(), LaunchEnvError> {
-        let path = Path::new(env_dir);
-        if !path.is_dir() {
+        let env_dir = env_dir.as_ref();
+        if !env_dir.is_dir() {
             return Ok(());
         }
 
-        let entries = fs::read_dir(path).map_err(|e| LaunchEnvError::ListDir {
-            path: env_dir.to_string(),
+        let entries = fs::read_dir(env_dir).map_err(|e| LaunchEnvError::ListDir {
+            path: env_dir.to_string_lossy().into_owned(),
             error: e,
         })?;
 
@@ -165,7 +166,7 @@ impl LaunchEnv {
                     Ok(e) => e,
                     Err(err) => {
                         return Some(Err(LaunchEnvError::ListDir {
-                            path: env_dir.to_string(),
+                            path: env_dir.to_string_lossy().into_owned(),
                             error: err,
                         }));
                     }
@@ -192,7 +193,7 @@ impl LaunchEnv {
             })?;
 
             // Read custom delimiter if present
-            let delim_path = Path::new(env_dir).join(format!("{}.delim", name));
+            let delim_path = env_dir.join(format!("{}.delim", name));
             let delim = if delim_path.is_file() {
                 fs::read_to_string(&delim_path).ok()
             } else {
@@ -312,8 +313,7 @@ mod tests {
         env.set("FOO", "original_foo");
         env.set("BAR", "original_bar");
 
-        env.add_env_dir(&dir_path.to_string_lossy(), ActionType::Override)
-            .unwrap();
+        env.add_env_dir(dir_path, ActionType::Override).unwrap();
 
         assert_eq!(env.get("FOO").unwrap(), "unsuffixed_val");
         assert_eq!(env.get("BAR").unwrap(), "override_val");
@@ -324,8 +324,7 @@ mod tests {
         fs::write(dir2_path.join("FOO.default"), "default_val").unwrap();
         fs::write(dir2_path.join("BAZ.default"), "default_val").unwrap();
 
-        env.add_env_dir(&dir2_path.to_string_lossy(), ActionType::Override)
-            .unwrap();
+        env.add_env_dir(dir2_path, ActionType::Override).unwrap();
 
         // FOO already exists, so default does not override it
         assert_eq!(env.get("FOO").unwrap(), "unsuffixed_val");
@@ -346,8 +345,7 @@ mod tests {
         env.set("PATH", "/usr/bin");
         env.set("VAR", "base");
 
-        env.add_env_dir(&dir_path.to_string_lossy(), ActionType::Override)
-            .unwrap();
+        env.add_env_dir(dir_path, ActionType::Override).unwrap();
 
         // PATH uses default separator (":" on unix)
         assert_eq!(env.get("PATH").unwrap(), "/layer/bin:/usr/bin");

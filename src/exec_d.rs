@@ -2,6 +2,7 @@ use crate::env::LaunchEnv;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
+use std::path::Path;
 use std::process::Command;
 
 #[cfg(unix)]
@@ -79,7 +80,11 @@ impl std::error::Error for ExecDError {}
 /// Executes the executable at the given path, capturing environment variables written to File Descriptor 3.
 /// The executable should implement the exec.d interface, writing TOML key-value pairs to FD 3.
 #[cfg(unix)]
-pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>, ExecDError> {
+pub fn run_exec_d<P: AsRef<Path>>(
+    path: P,
+    env: &LaunchEnv,
+) -> Result<HashMap<String, String>, ExecDError> {
+    let path = path.as_ref();
     let (reader_fd, writer_fd) = rustix::pipe::pipe()
         .map_err(|e| ExecDError::CreatePipe(format!("Failed to create OS pipe: {}", e)))?;
 
@@ -114,7 +119,7 @@ pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>
     }
 
     let mut child = cmd.spawn().map_err(|e| ExecDError::Spawn {
-        path: path.to_string(),
+        path: path.to_string_lossy().into_owned(),
         error: e,
     })?;
 
@@ -131,13 +136,13 @@ pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>
         })?;
 
     let status = child.wait().map_err(|e| ExecDError::Wait {
-        path: path.to_string(),
+        path: path.to_string_lossy().into_owned(),
         error: e,
     })?;
 
     if !status.success() {
         return Err(ExecDError::ExecutionFailed {
-            path: path.to_string(),
+            path: path.to_string_lossy().into_owned(),
             status,
         });
     }
@@ -146,13 +151,12 @@ pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>
         return Ok(HashMap::new());
     }
 
-    let env_vars: HashMap<String, String> = toml::from_str(&toml_output).map_err(|e| {
-        ExecDError::Decode {
-            path: path.to_string(),
+    let env_vars: HashMap<String, String> =
+        toml::from_str(&toml_output).map_err(|e| ExecDError::Decode {
+            path: path.to_string_lossy().into_owned(),
             error: Box::new(e),
             output: toml_output,
-        }
-    })?;
+        })?;
 
     Ok(env_vars)
 }
@@ -185,10 +189,14 @@ mod win32 {
 /// Executes the executable at the given path on Windows, capturing environment variables
 /// written to the inherited pipe handle specified by CNB_EXEC_D_HANDLE.
 #[cfg(windows)]
-pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>, ExecDError> {
+pub fn run_exec_d<P: AsRef<Path>>(
+    path: P,
+    env: &LaunchEnv,
+) -> Result<HashMap<String, String>, ExecDError> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::process::Stdio;
 
+    let path = path.as_ref();
     let mut read_handle: win32::HANDLE = std::ptr::null_mut();
     let mut write_handle: win32::HANDLE = std::ptr::null_mut();
 
@@ -223,7 +231,7 @@ pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>
     cmd.envs(&child_env);
 
     let mut child = cmd.spawn().map_err(|e| ExecDError::Spawn {
-        path: path.to_string(),
+        path: path.to_string_lossy().into_owned(),
         error: e,
     })?;
 
@@ -239,13 +247,13 @@ pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>
         })?;
 
     let status = child.wait().map_err(|e| ExecDError::Wait {
-        path: path.to_string(),
+        path: path.to_string_lossy().into_owned(),
         error: e,
     })?;
 
     if !status.success() {
         return Err(ExecDError::ExecutionFailed {
-            path: path.to_string(),
+            path: path.to_string_lossy().into_owned(),
             status,
         });
     }
@@ -256,7 +264,7 @@ pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>
 
     let env_vars: HashMap<String, String> =
         toml::from_str(&toml_output).map_err(|e| ExecDError::Decode {
-            path: path.to_string(),
+            path: path.to_string_lossy().into_owned(),
             error: Box::new(e),
             output: toml_output,
         })?;
@@ -288,7 +296,7 @@ echo 'MY_NEW_VAR = "injected_value"' >&3
         fs::set_permissions(&script_path, perms).unwrap();
 
         let env = LaunchEnv::new(&[], "", "");
-        let res = run_exec_d(&script_path.to_string_lossy(), &env);
+        let res = run_exec_d(&script_path, &env);
 
         assert!(res.is_ok(), "Failed to run exec.d: {:?}", res.err());
         let vars = res.unwrap();

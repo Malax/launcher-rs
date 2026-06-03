@@ -278,7 +278,9 @@ fn run_launcher() -> Result<(), LaunchError> {
         ));
     }
 
-    let resolved_process = selector.select().map_err(|e| LaunchError::ProcessSelection(Box::new(e)))?;
+    let resolved_process = selector
+        .select()
+        .map_err(|e| LaunchError::ProcessSelection(Box::new(e)))?;
 
     // 8. Prepare Launch Environment
     let host_envs: Vec<(String, String)> = std::env::vars().collect();
@@ -297,26 +299,24 @@ fn run_launcher() -> Result<(), LaunchError> {
 
         // 1. Add layer roots to path variables
         for ldir in &layer_dirs {
-            env.add_root_dir(&ldir.to_string_lossy())
+            env.add_root_dir(ldir)
                 .map_err(|e| LaunchError::LaunchEnv(Box::new(e)))?;
         }
 
         // 2. Add env file modifications
         for ldir in &layer_dirs {
-            let ldir_str = ldir.to_string_lossy();
-
             // Apply <layer>/env
-            env.add_env_dir(&format!("{}/env", ldir_str), ActionType::Override)
+            env.add_env_dir(ldir.join("env"), ActionType::Override)
                 .map_err(|e| LaunchError::LaunchEnv(Box::new(e)))?;
 
             // Apply <layer>/env.launch
-            env.add_env_dir(&format!("{}/env.launch", ldir_str), ActionType::Override)
+            env.add_env_dir(ldir.join("env.launch"), ActionType::Override)
                 .map_err(|e| LaunchError::LaunchEnv(Box::new(e)))?;
 
             // Apply <layer>/env.launch/<process>
             if !resolved_process.proc_type.is_empty() {
                 env.add_env_dir(
-                    &format!("{}/env.launch/{}", ldir_str, resolved_process.proc_type),
+                    ldir.join("env.launch").join(&resolved_process.proc_type),
                     ActionType::Override,
                 )
                 .map_err(|e| LaunchError::LaunchEnv(Box::new(e)))?;
@@ -486,8 +486,7 @@ fn run_exec_d_in_dir(dir: &Path, env: &mut LaunchEnv) -> Result<(), LaunchError>
     let files = read_layer_files(dir, "List exec.d dir")?;
 
     for file in files {
-        let file_str = file.to_string_lossy();
-        let res = exec_d::run_exec_d(&file_str, env).map_err(|e| LaunchError::ExecD(Box::new(e)))?;
+        let res = exec_d::run_exec_d(&file, env).map_err(|e| LaunchError::ExecD(Box::new(e)))?;
         for (k, v) in res {
             env.set(&k, &v);
         }

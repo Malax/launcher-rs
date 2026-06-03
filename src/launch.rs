@@ -269,7 +269,10 @@ impl<'a> ProcessSelector<'a> {
 
         // Rule 1: argv0 matches a process type (e.g. symlink)
         let raw_proc_opt = if process_name != "launcher" {
-            self.metadata.processes.iter().find(|p| p.proc_type == process_name)
+            self.metadata
+                .processes
+                .iter()
+                .find(|p| p.proc_type == process_name)
         } else {
             None
         };
