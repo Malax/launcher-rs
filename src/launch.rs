@@ -74,11 +74,58 @@ pub struct ResolvedProcess {
     pub direct: bool,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum ProcessSelectionError {
+    NoCommandAndNoDefault,
+    IneligibleProcess { name: String, exec_env: String },
+    IneligibleDefault,
+    IneligibleProcessSimple { name: String },
+    BuildpackNotFound { bp_id: String, proc_type: String },
+    EmptyCommand { proc_type: String },
+    BuildpackApi(crate::api::buildpack::BuildpackApiError),
+}
+
+impl std::fmt::Display for ProcessSelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProcessSelectionError::NoCommandAndNoDefault => {
+                write!(f, "determine start command: when there is no default process a command is required")
+            }
+            ProcessSelectionError::IneligibleProcess { name, exec_env } => {
+                write!(f, "process type '{}' is not eligible for execution environment '{}'", name, exec_env)
+            }
+            ProcessSelectionError::IneligibleDefault => {
+                write!(f, "Default process is not eligible for execution environment")
+            }
+            ProcessSelectionError::IneligibleProcessSimple { name } => {
+                write!(f, "Process type '{}' is not eligible", name)
+            }
+            ProcessSelectionError::BuildpackNotFound { bp_id, proc_type } => {
+                write!(f, "Buildpack '{}' not found in metadata for process '{}'", bp_id, proc_type)
+            }
+            ProcessSelectionError::EmptyCommand { proc_type } => {
+                write!(f, "Command entries list is empty for process '{}'", proc_type)
+            }
+            ProcessSelectionError::BuildpackApi(err) => {
+                write!(f, "{}", err)
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProcessSelectionError {}
+
+impl From<crate::api::buildpack::BuildpackApiError> for ProcessSelectionError {
+    fn from(err: crate::api::buildpack::BuildpackApiError) -> Self {
+        ProcessSelectionError::BuildpackApi(err)
+    }
+}
+
 impl ResolvedProcess {
     /// Creates a user-provided process definition from raw command-line arguments.
-    pub fn user_provided(cmd: &[String], app_dir: &str) -> Result<Self, String> {
+    pub fn user_provided(cmd: &[String], app_dir: &str) -> Result<Self, ProcessSelectionError> {
         if cmd.is_empty() {
-            return Err("when there is no default process a command is required".to_string());
+            return Err(ProcessSelectionError::NoCommandAndNoDefault);
         }
 
         if cmd.len() > 1 && cmd[0] == "--" {
@@ -108,8 +155,15 @@ impl ResolvedProcess {
         let path_val = env.get("PATH").cloned().unwrap_or_default();
 
         // Find the absolute path to the command
-        let binary_path = which::which_in(&self.command, Some(&path_val), &std::env::current_dir()?)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, format!("Path lookup failed for '{}': {}", self.command, e)))?;
+        let binary_path =
+            which::which_in(&self.command, Some(&path_val), &std::env::current_dir()?).map_err(
+                |e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Path lookup failed for '{}': {}", self.command, e),
+                    )
+                },
+            )?;
 
         // Change directory to the process working directory
         let work_dir = if self.working_directory.is_empty() {
@@ -134,8 +188,15 @@ impl ResolvedProcess {
         let path_val = env.get("PATH").cloned().unwrap_or_default();
 
         // Find the absolute path to the command
-        let binary_path = which::which_in(&self.command, Some(&path_val), &std::env::current_dir()?)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, format!("Path lookup failed for '{}': {}", self.command, e)))?;
+        let binary_path =
+            which::which_in(&self.command, Some(&path_val), &std::env::current_dir()?).map_err(
+                |e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("Path lookup failed for '{}': {}", self.command, e),
+                    )
+                },
+            )?;
 
         // Change directory to the process working directory
         let work_dir = if self.working_directory.is_empty() {
@@ -165,16 +226,19 @@ pub struct ProcessSelector<'a> {
 }
 
 impl<'a> ProcessSelector<'a> {
-    pub fn select(self) -> Result<ResolvedProcess, String> {
+    pub fn select(self) -> Result<ResolvedProcess, ProcessSelectionError> {
         let argv0 = self.args.first().map(|s| s.as_str()).unwrap_or("launcher");
-        
+
         let argv0_file_name = std::path::Path::new(argv0)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "launcher".to_string());
 
         let process_name = if cfg!(windows) {
-            argv0_file_name.strip_suffix(".exe").unwrap_or(&argv0_file_name).to_string()
+            argv0_file_name
+                .strip_suffix(".exe")
+                .unwrap_or(&argv0_file_name)
+                .to_string()
         } else {
             argv0_file_name
         };
@@ -187,25 +251,62 @@ impl<'a> ProcessSelector<'a> {
 
         // Rule 1: argv0 matches a process type (e.g. symlink)
         if process_name != "launcher" {
-            if let Some(raw_proc) = self.metadata.processes.iter().find(|p| p.proc_type == process_name) {
-                return resolve_process(raw_proc, &self.metadata.buildpacks, self.platform_api, self.exec_env, &user_args)?
-                    .ok_or_else(|| format!("process type '{}' is not eligible for execution environment '{}'", process_name, self.exec_env));
+            if let Some(raw_proc) = self
+                .metadata
+                .processes
+                .iter()
+                .find(|p| p.proc_type == process_name)
+            {
+                return resolve_process(
+                    raw_proc,
+                    &self.metadata.buildpacks,
+                    self.platform_api,
+                    self.exec_env,
+                    &user_args,
+                )?
+                .ok_or_else(|| {
+                    ProcessSelectionError::IneligibleProcess {
+                        name: process_name.clone(),
+                        exec_env: self.exec_env.to_string(),
+                    }
+                });
             }
         }
 
         if user_args.is_empty() {
             // Rule 2: Default process from metadata
             if let Some(raw_proc) = self.metadata.processes.iter().find(|p| p.default) {
-                return resolve_process(raw_proc, &self.metadata.buildpacks, self.platform_api, self.exec_env, &[])?
-                    .ok_or_else(|| "Default process is not eligible for execution environment".to_string());
+                return resolve_process(
+                    raw_proc,
+                    &self.metadata.buildpacks,
+                    self.platform_api,
+                    self.exec_env,
+                    &[],
+                )?
+                .ok_or_else(|| {
+                    ProcessSelectionError::IneligibleDefault
+                });
             }
-            return Err("determine start command: when there is no default process a command is required".to_string());
+            return Err(ProcessSelectionError::NoCommandAndNoDefault);
         }
 
         // Rule 3: user_args[0] matches a process type (fallback mechanism)
-        if let Some(raw_proc) = self.metadata.processes.iter().find(|p| p.proc_type == user_args[0]) {
-            return resolve_process(raw_proc, &self.metadata.buildpacks, self.platform_api, self.exec_env, &user_args[1..])?
-                .ok_or_else(|| format!("Process type '{}' is not eligible", user_args[0]));
+        if let Some(raw_proc) = self
+            .metadata
+            .processes
+            .iter()
+            .find(|p| p.proc_type == user_args[0])
+        {
+            return resolve_process(
+                raw_proc,
+                &self.metadata.buildpacks,
+                self.platform_api,
+                self.exec_env,
+                &user_args[1..],
+            )?
+            .ok_or_else(|| ProcessSelectionError::IneligibleProcessSimple {
+                name: user_args[0].clone(),
+            });
         }
 
         // Rule 4: Custom user-provided command
@@ -221,7 +322,7 @@ pub fn resolve_process(
     platform_api: &Version,
     exec_env: &str,
     user_args: &[String],
-) -> Result<Option<ResolvedProcess>, String> {
+) -> Result<Option<ResolvedProcess>, ProcessSelectionError> {
     // 1. Check eligibility (Platform API >= 0.15)
     if platform_api.at_least("0.15") {
         if let Some(ref envs) = raw.exec_env {
@@ -240,10 +341,10 @@ pub fn resolve_process(
             .iter()
             .find(|bp| bp.id == raw.buildpack_id)
             .ok_or_else(|| {
-                format!(
-                    "Buildpack '{}' not found in metadata for process '{}'",
-                    raw.buildpack_id, raw.proc_type
-                )
+                ProcessSelectionError::BuildpackNotFound {
+                    bp_id: raw.buildpack_id.clone(),
+                    proc_type: raw.proc_type.clone(),
+                }
             })?;
         Some(crate::api::buildpack::verify_buildpack_api(
             &bp.id, &bp.api,
@@ -259,10 +360,9 @@ pub fn resolve_process(
     };
 
     if entries.is_empty() {
-        return Err(format!(
-            "Command entries list is empty for process '{}'",
-            raw.proc_type
-        ));
+        return Err(ProcessSelectionError::EmptyCommand {
+            proc_type: raw.proc_type.clone(),
+        });
     }
 
     let resolved_command = entries[0].clone();
@@ -316,7 +416,6 @@ pub fn resolve_process(
     }))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,13 +463,17 @@ mod tests {
 
         // 2. Command separation test (Platform < 0.10 vs >= 0.10)
         let plat_9 = Version::new(0, 9);
-        let res_p9 = resolve_process(&raw, &buildpacks, &plat_9, "production", &[]).unwrap().unwrap();
+        let res_p9 = resolve_process(&raw, &buildpacks, &plat_9, "production", &[])
+            .unwrap()
+            .unwrap();
         // under plat < 0.10, entries[1..] is prepended to args
         assert_eq!(res_p9.command, "node");
         assert_eq!(res_p9.args, vec!["server.js", "--port", "8080"]);
 
         let plat_10 = Version::new(0, 10);
-        let res_p10 = resolve_process(&raw, &buildpacks, &plat_10, "production", &[]).unwrap().unwrap();
+        let res_p10 = resolve_process(&raw, &buildpacks, &plat_10, "production", &[])
+            .unwrap()
+            .unwrap();
         assert_eq!(res_p10.command, "node");
         // under plat >= 0.10, entries[1..] are always-provided, args are defaults (and since user_args is empty, they are appended)
         assert_eq!(res_p10.args, vec!["server.js", "--port", "8080"]);
@@ -395,7 +498,15 @@ mod tests {
             api: "0.8".to_string(),
         }];
         let plat = Version::new(0, 10);
-        let res_old = resolve_process(&raw, &bps_old, &plat, "production", &["user-arg".to_string()]).unwrap().unwrap();
+        let res_old = resolve_process(
+            &raw,
+            &bps_old,
+            &plat,
+            "production",
+            &["user-arg".to_string()],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(res_old.args, vec!["server.js", "user-arg"]);
 
         // 2. Buildpack API >= 0.9: user args replace process args
@@ -403,7 +514,15 @@ mod tests {
             id: "my-bp".to_string(),
             api: "0.9".to_string(),
         }];
-        let res_new = resolve_process(&raw, &bps_new, &plat, "production", &["user-arg".to_string()]).unwrap().unwrap();
+        let res_new = resolve_process(
+            &raw,
+            &bps_new,
+            &plat,
+            "production",
+            &["user-arg".to_string()],
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(res_new.args, vec!["user-arg"]);
     }
 
@@ -450,17 +569,45 @@ mod tests {
         let plat_15 = Version::new(0, 15);
 
         // No exec-env -> matches any
-        assert!(resolve_process(&raw_no_env, &buildpacks, &plat_15, "test", &[]).unwrap().is_some());
-        assert!(resolve_process(&raw_no_env, &buildpacks, &plat_15, "", &[]).unwrap().is_some());
+        assert!(
+            resolve_process(&raw_no_env, &buildpacks, &plat_15, "test", &[])
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            resolve_process(&raw_no_env, &buildpacks, &plat_15, "", &[])
+                .unwrap()
+                .is_some()
+        );
 
         // Wildcard '*' -> matches any
-        assert!(resolve_process(&raw_wildcard, &buildpacks, &plat_15, "test", &[]).unwrap().is_some());
-        assert!(resolve_process(&raw_wildcard, &buildpacks, &plat_15, "", &[]).unwrap().is_some());
+        assert!(
+            resolve_process(&raw_wildcard, &buildpacks, &plat_15, "test", &[])
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            resolve_process(&raw_wildcard, &buildpacks, &plat_15, "", &[])
+                .unwrap()
+                .is_some()
+        );
 
         // Specific 'production' -> matches production, fails on test/empty
-        assert!(resolve_process(&raw_prod, &buildpacks, &plat_15, "production", &[]).unwrap().is_some());
-        assert!(resolve_process(&raw_prod, &buildpacks, &plat_15, "test", &[]).unwrap().is_none());
-        assert!(resolve_process(&raw_prod, &buildpacks, &plat_15, "", &[]).unwrap().is_none());
+        assert!(
+            resolve_process(&raw_prod, &buildpacks, &plat_15, "production", &[])
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            resolve_process(&raw_prod, &buildpacks, &plat_15, "test", &[])
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            resolve_process(&raw_prod, &buildpacks, &plat_15, "", &[])
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

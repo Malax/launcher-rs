@@ -29,10 +29,34 @@ pub fn is_deprecated(requested: &Version) -> bool {
     })
 }
 
-pub fn verify_buildpack_api(bp_id: &str, requested_str: &str) -> Result<Version, String> {
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum BuildpackApiError {
+    Parse { bp_id: String, version: String, error: String },
+    Incompatible { bp_id: String, version: String },
+}
+
+impl std::fmt::Display for BuildpackApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildpackApiError::Parse { bp_id, version, error } => {
+                write!(f, "Parse buildpack API '{}' for buildpack '{}': {}", version, bp_id, error)
+            }
+            BuildpackApiError::Incompatible { bp_id, version } => {
+                write!(f, "buildpack API version '{}' is incompatible with the lifecycle for buildpack '{}'", version, bp_id)
+            }
+        }
+    }
+}
+
+impl std::error::Error for BuildpackApiError {}
+
+pub fn verify_buildpack_api(bp_id: &str, requested_str: &str) -> Result<Version, BuildpackApiError> {
     let clean = requested_str.trim();
-    let requested = Version::from_str(clean)
-        .map_err(|e| format!("Parse buildpack API '{}' for buildpack '{}': {}", clean, bp_id, e))?;
+    let requested = Version::from_str(clean).map_err(|e| BuildpackApiError::Parse {
+        bp_id: bp_id.to_string(),
+        version: clean.to_string(),
+        error: e,
+    })?;
 
     if is_supported(&requested) {
         if is_deprecated(&requested) {
@@ -40,10 +64,10 @@ pub fn verify_buildpack_api(bp_id: &str, requested_str: &str) -> Result<Version,
         }
         Ok(requested)
     } else {
-        Err(format!(
-            "buildpack API version '{}' is incompatible with the lifecycle for buildpack '{}'",
-            clean, bp_id
-        ))
+        Err(BuildpackApiError::Incompatible {
+            bp_id: bp_id.to_string(),
+            version: clean.to_string(),
+        })
     }
 }
 

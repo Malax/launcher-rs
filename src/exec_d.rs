@@ -13,12 +13,51 @@ use std::os::unix::io::IntoRawFd;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+#[derive(Debug)]
+pub enum ExecDError {
+    CreatePipe(String),
+    Spawn { path: String, error: std::io::Error },
+    ReadOutput { error: std::io::Error, channel: &'static str },
+    Wait { path: String, error: std::io::Error },
+    ExecutionFailed { path: String, status: std::process::ExitStatus },
+    Decode { path: String, error: toml::de::Error, output: String },
+}
+
+impl std::fmt::Display for ExecDError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ExecDError::CreatePipe(msg) => write!(f, "{}", msg),
+            ExecDError::Spawn { path, error } => {
+                write!(f, "Failed to spawn exec.d binary '{}': {}", path, error)
+            }
+            ExecDError::ReadOutput { error, channel } => {
+                write!(f, "Failed to read {} output from exec.d: {}", channel, error)
+            }
+            ExecDError::Wait { path: _, error } => {
+                write!(f, "Failed to wait for exec.d child process: {}", error)
+            }
+            ExecDError::ExecutionFailed { path, status } => {
+                write!(f, "exec.d binary '{}' failed with status: {}", path, status)
+            }
+            ExecDError::Decode { path, error, output } => {
+                write!(
+                    f,
+                    "Failed to decode TOML output from exec.d binary '{}': {}\nOutput: '{}'",
+                    path, error, output
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ExecDError {}
+
 /// Executes the executable at the given path, capturing environment variables written to File Descriptor 3.
 /// The executable should implement the exec.d interface, writing TOML key-value pairs to FD 3.
 #[cfg(unix)]
-pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>, String> {
+pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>, ExecDError> {
     let (reader_fd, writer_fd) =
-        rustix::pipe::pipe().map_err(|e| format!("Failed to create OS pipe: {}", e))?;
+        rustix::pipe::pipe().map_err(|e| ExecDError::CreatePipe(format!("Failed to create OS pipe: {}", e)))?;
 
     let reader: File = reader_fd.into();
     let writer: File = writer_fd.into();
@@ -52,7 +91,10 @@ pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("Failed to spawn exec.d binary '{}': {}", path, e))?;
+        .map_err(|e| ExecDError::Spawn {
+            path: path.to_string(),
+            error: e,
+        })?;
 
     // CRITICAL: Close our copy of the writer in the parent so the reader will receive EOF
     // once the child process closes its copy (e.g. upon exiting or explicitly closing FD 3).
@@ -61,17 +103,23 @@ pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>
     let mut toml_output = String::new();
     let mut r = reader;
     r.read_to_string(&mut toml_output)
-        .map_err(|e| format!("Failed to read FD 3 output from exec.d: {}", e))?;
+        .map_err(|e| ExecDError::ReadOutput {
+            error: e,
+            channel: "FD 3",
+        })?;
 
     let status = child
         .wait()
-        .map_err(|e| format!("Failed to wait for exec.d child process: {}", e))?;
+        .map_err(|e| ExecDError::Wait {
+            path: path.to_string(),
+            error: e,
+        })?;
 
     if !status.success() {
-        return Err(format!(
-            "exec.d binary '{}' failed with status: {}",
-            path, status
-        ));
+        return Err(ExecDError::ExecutionFailed {
+            path: path.to_string(),
+            status,
+        });
     }
 
     if toml_output.trim().is_empty() {
@@ -79,10 +127,11 @@ pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>
     }
 
     let env_vars: HashMap<String, String> = toml::from_str(&toml_output).map_err(|e| {
-        format!(
-            "Failed to decode TOML output from exec.d binary '{}': {}\nOutput: '{}'",
-            path, e, toml_output
-        )
+        ExecDError::Decode {
+            path: path.to_string(),
+            error: e,
+            output: toml_output,
+        }
     })?;
 
     Ok(env_vars)
@@ -116,7 +165,7 @@ mod win32 {
 /// Executes the executable at the given path on Windows, capturing environment variables
 /// written to the inherited pipe handle specified by CNB_EXEC_D_HANDLE.
 #[cfg(windows)]
-pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>, String> {
+pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>, ExecDError> {
     use std::os::windows::io::{FromRawHandle, AsRawHandle};
     use std::process::Stdio;
 
@@ -139,7 +188,7 @@ pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>
     };
 
     if res == 0 {
-        return Err("Failed to create Win32 pipe".to_string());
+        return Err(ExecDError::CreatePipe("Failed to create Win32 pipe".to_string()));
     }
 
     // Convert raw handles into Rust File objects
@@ -160,7 +209,10 @@ pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| format!("Failed to spawn exec.d binary '{}': {}", path, e))?;
+        .map_err(|e| ExecDError::Spawn {
+            path: path.to_string(),
+            error: e,
+        })?;
 
     // Close parent's copy of writer
     drop(writer);
@@ -168,17 +220,23 @@ pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>
     let mut toml_output = String::new();
     let mut r = reader;
     r.read_to_string(&mut toml_output)
-        .map_err(|e| format!("Failed to read handle output from exec.d: {}", e))?;
+        .map_err(|e| ExecDError::ReadOutput {
+            error: e,
+            channel: "handle",
+        })?;
 
     let status = child
         .wait()
-        .map_err(|e| format!("Failed to wait for exec.d child process: {}", e))?;
+        .map_err(|e| ExecDError::Wait {
+            path: path.to_string(),
+            error: e,
+        })?;
 
     if !status.success() {
-        return Err(format!(
-            "exec.d binary '{}' failed with status: {}",
-            path, status
-        ));
+        return Err(ExecDError::ExecutionFailed {
+            path: path.to_string(),
+            status,
+        });
     }
 
     if toml_output.trim().is_empty() {
@@ -186,10 +244,11 @@ pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>
     }
 
     let env_vars: HashMap<String, String> = toml::from_str(&toml_output).map_err(|e| {
-        format!(
-            "Failed to decode TOML output from exec.d binary '{}': {}\nOutput: '{}'",
-            path, e, toml_output
-        )
+        ExecDError::Decode {
+            path: path.to_string(),
+            error: e,
+            output: toml_output,
+        }
     })?;
 
     Ok(env_vars)

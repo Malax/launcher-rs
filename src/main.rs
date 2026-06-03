@@ -75,25 +75,88 @@ fn print_warning(msg: &str) {
 
 fn main() {
     if let Err(e) = run_launcher() {
-        let msg = if e.message.starts_with("failed to ") {
-            e.message.clone()
+        let err_str = e.to_string();
+        let msg = if err_str.starts_with("failed to ") {
+            err_str
         } else {
-            format!("failed to {}", e.message)
+            format!("failed to {}", err_str)
         };
         print_error(&msg);
-        std::process::exit(e.code.as_i32());
+        std::process::exit(e.code().as_i32());
     }
 }
 
 #[derive(Debug)]
-struct LaunchError {
-    message: String,
-    code: ExitCode,
+pub enum LaunchError {
+    PlatformApi(api::platform::PlatformApiError),
+    SetBuildpackApi { bp_id: String, error: api::buildpack::BuildpackApiError },
+    LaunchEnv(env::LaunchEnvError),
+    ExecD(exec_d::ExecDError),
+    ProcessSelection(launch::ProcessSelectionError),
+    MetadataNotFound { path: String },
+    MetadataRead { path: String, error: std::io::Error },
+    MetadataParse { error: toml::de::Error },
+    ListLayerDirs { context: String, error: std::io::Error },
+    ListLayerFiles { context: String, error: std::io::Error },
+    DirectExec(std::io::Error),
+    BashExec(std::io::Error),
 }
 
+impl std::fmt::Display for LaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LaunchError::PlatformApi(api::platform::PlatformApiError::Empty) => {
+                write!(f, "get platform API version; please set 'CNB_PLATFORM_API' to specify the desired platform API version")
+            }
+            LaunchError::PlatformApi(api::platform::PlatformApiError::Invalid(v)) => {
+                write!(f, "parse platform API '{}'", v)
+            }
+            LaunchError::PlatformApi(api::platform::PlatformApiError::Incompatible(v)) => {
+                write!(f, "set platform API: platform API version '{}' is incompatible with the lifecycle", v)
+            }
+            LaunchError::SetBuildpackApi { bp_id, error } => {
+                write!(f, "set API for buildpack '{}': {}", bp_id, error)
+            }
+            LaunchError::LaunchEnv(err) => write!(f, "{}", err),
+            LaunchError::ExecD(err) => write!(f, "{}", err),
+            LaunchError::ProcessSelection(err) => write!(f, "{}", err),
+            LaunchError::MetadataNotFound { path } => {
+                write!(f, "read metadata: metadata file not found at '{}'", path)
+            }
+            LaunchError::MetadataRead { path: _, error } => {
+                write!(f, "read metadata: {}", error)
+            }
+            LaunchError::MetadataParse { error } => {
+                write!(f, "read metadata: parse failed: {}", error)
+            }
+            LaunchError::ListLayerDirs { context, error } => {
+                write!(f, "{}: {}", context, error)
+            }
+            LaunchError::ListLayerFiles { context, error } => {
+                write!(f, "{}: {}", context, error)
+            }
+            LaunchError::DirectExec(error) => {
+                write!(f, "direct exec: {}", error)
+            }
+            LaunchError::BashExec(error) => {
+                write!(f, "bash exec: {}", error)
+            }
+        }
+    }
+}
+
+impl std::error::Error for LaunchError {}
+
 impl LaunchError {
-    fn new(msg: String, code: ExitCode) -> Self {
-        LaunchError { message: msg, code }
+    pub fn code(&self) -> ExitCode {
+        match self {
+            LaunchError::PlatformApi(_) => ExitCode::PlatformApiIncompatible,
+            LaunchError::SetBuildpackApi { .. } => ExitCode::BuildpackApiIncompatible,
+            LaunchError::ProcessSelection(launch::ProcessSelectionError::BuildpackApi(_)) => {
+                ExitCode::BuildpackApiIncompatible
+            }
+            _ => ExitCode::LaunchError,
+        }
     }
 }
 
@@ -102,23 +165,8 @@ fn run_launcher() -> Result<(), LaunchError> {
     let platform_api_str =
         std::env::var("CNB_PLATFORM_API").unwrap_or_else(|_| DEFAULT_PLATFORM_API.to_string());
 
-    let platform_api = api::platform::verify_platform_api(&platform_api_str).map_err(|e| {
-        let msg = match e {
-            api::platform::PlatformApiError::Empty => {
-                "get platform API version; please set 'CNB_PLATFORM_API' to specify the desired platform API version".to_string()
-            }
-            api::platform::PlatformApiError::Invalid(val) => {
-                format!("parse platform API '{}'", val)
-            }
-            api::platform::PlatformApiError::Incompatible(val) => {
-                format!("set platform API: platform API version '{}' is incompatible with the lifecycle", val)
-            }
-        };
-        LaunchError::new(
-            msg,
-            ExitCode::PlatformApiIncompatible,
-        )
-    })?;
+    let platform_api = api::platform::verify_platform_api(&platform_api_str)
+        .map_err(LaunchError::PlatformApi)?;
 
     // 2. Parse Layers, App directories, and Exec Env
     let layers_dir =
@@ -129,32 +177,28 @@ fn run_launcher() -> Result<(), LaunchError> {
     // 3. Read metadata.toml
     let metadata_path = Path::new(&layers_dir).join("config").join("metadata.toml");
     if !metadata_path.is_file() {
-        return Err(LaunchError::new(
-            format!(
-                "read metadata: metadata file not found at '{}'",
-                metadata_path.display()
-            ),
-            ExitCode::LaunchError,
-        ));
+        return Err(LaunchError::MetadataNotFound {
+            path: metadata_path.to_string_lossy().into_owned(),
+        });
     }
 
-    let metadata_content = fs::read_to_string(&metadata_path)
-        .map_err(|e| LaunchError::new(format!("read metadata: {}", e), ExitCode::LaunchError))?;
-
-    let metadata: RawMetadata = toml::from_str(&metadata_content).map_err(|e| {
-        LaunchError::new(
-            format!("read metadata: parse failed: {}", e),
-            ExitCode::LaunchError,
-        )
+    let metadata_content = fs::read_to_string(&metadata_path).map_err(|e| {
+        LaunchError::MetadataRead {
+            path: metadata_path.to_string_lossy().into_owned(),
+            error: e,
+        }
     })?;
+
+    let metadata: RawMetadata = toml::from_str(&metadata_content)
+        .map_err(|e| LaunchError::MetadataParse { error: e })?;
 
     // 4. Verify each buildpack's API
     for bp in &metadata.buildpacks {
         api::buildpack::verify_buildpack_api(&bp.id, &bp.api).map_err(|e| {
-            LaunchError::new(
-                format!("set API for buildpack '{}': {}", bp.id, e),
-                ExitCode::BuildpackApiIncompatible,
-            )
+            LaunchError::SetBuildpackApi {
+                bp_id: bp.id.clone(),
+                error: e,
+            }
         })?;
     }
 
@@ -207,7 +251,7 @@ fn run_launcher() -> Result<(), LaunchError> {
 
     let resolved_process = selector
         .select()
-        .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?;
+        .map_err(LaunchError::ProcessSelection)?;
 
     // 8. Prepare Launch Environment
     let host_envs: Vec<(String, String)> = std::env::vars().collect();
@@ -227,7 +271,7 @@ fn run_launcher() -> Result<(), LaunchError> {
         // 1. Add layer roots to path variables
         for ldir in &layer_dirs {
             env.add_root_dir(&ldir.to_string_lossy())
-                .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?;
+                .map_err(LaunchError::LaunchEnv)?;
         }
 
         // 2. Add env file modifications
@@ -236,11 +280,11 @@ fn run_launcher() -> Result<(), LaunchError> {
 
             // Apply <layer>/env
             env.add_env_dir(&format!("{}/env", ldir_str), ActionType::Override)
-                .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?;
+                .map_err(LaunchError::LaunchEnv)?;
 
             // Apply <layer>/env.launch
             env.add_env_dir(&format!("{}/env.launch", ldir_str), ActionType::Override)
-                .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?;
+                .map_err(LaunchError::LaunchEnv)?;
 
             // Apply <layer>/env.launch/<process>
             if !resolved_process.proc_type.is_empty() {
@@ -248,7 +292,7 @@ fn run_launcher() -> Result<(), LaunchError> {
                     &format!("{}/env.launch/{}", ldir_str, resolved_process.proc_type),
                     ActionType::Override,
                 )
-                .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?;
+                .map_err(LaunchError::LaunchEnv)?;
             }
         }
     }
@@ -280,12 +324,7 @@ fn run_launcher() -> Result<(), LaunchError> {
     // 10. Execute decided process strategy
     if resolved_process.direct {
         // Direct execution (Shell-Free!)
-        if let Err(err) = resolved_process.launch_direct(&env) {
-            return Err(LaunchError::new(
-                format!("direct exec: {}", err),
-                ExitCode::LaunchError,
-            ));
-        }
+        resolved_process.launch_direct(&env).map_err(LaunchError::DirectExec)?;
         Ok(())
     } else {
         // Indirect execution (Invokes Bash with sourced profiles)
@@ -341,12 +380,7 @@ fn run_launcher() -> Result<(), LaunchError> {
         #[cfg(windows)]
         let shell = CmdShell;
 
-        if let Err(err) = shell.launch(shell_proc) {
-            return Err(LaunchError::new(
-                format!("bash exec: {}", err),
-                ExitCode::LaunchError,
-            ));
-        }
+        shell.launch(shell_proc).map_err(LaunchError::BashExec)?;
         Ok(())
     }
 }
@@ -356,11 +390,17 @@ fn read_layer_dirs<P: AsRef<Path>>(
     error_context: &str,
 ) -> Result<Vec<std::path::PathBuf>, LaunchError> {
     let entries = fs::read_dir(bp_dir).map_err(|e| {
-        LaunchError::new(format!("{}: {}", error_context, e), ExitCode::LaunchError)
+        LaunchError::ListLayerDirs {
+            context: error_context.to_string(),
+            error: e,
+        }
     })?;
 
     let mut dirs = entries
-        .map(|res| res.map_err(|e| LaunchError::new(e.to_string(), ExitCode::LaunchError)))
+        .map(|res| res.map_err(|e| LaunchError::ListLayerDirs {
+            context: error_context.to_string(),
+            error: e,
+        }))
         .filter_map(|res| match res {
             Ok(entry) => {
                 if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
@@ -382,11 +422,17 @@ fn read_layer_files<P: AsRef<Path>>(
     error_context: &str,
 ) -> Result<Vec<std::path::PathBuf>, LaunchError> {
     let entries = fs::read_dir(dir).map_err(|e| {
-        LaunchError::new(format!("{}: {}", error_context, e), ExitCode::LaunchError)
+        LaunchError::ListLayerFiles {
+            context: error_context.to_string(),
+            error: e,
+        }
     })?;
 
     let mut files = entries
-        .map(|res| res.map_err(|e| LaunchError::new(e.to_string(), ExitCode::LaunchError)))
+        .map(|res| res.map_err(|e| LaunchError::ListLayerFiles {
+            context: error_context.to_string(),
+            error: e,
+        }))
         .filter_map(|res| match res {
             Ok(entry) => {
                 if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
@@ -412,8 +458,7 @@ fn run_exec_d_in_dir(dir: &Path, env: &mut LaunchEnv) -> Result<(), LaunchError>
 
     for file in files {
         let file_str = file.to_string_lossy();
-        let res = exec_d::run_exec_d(&file_str, env)
-            .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?;
+        let res = exec_d::run_exec_d(&file_str, env).map_err(LaunchError::ExecD)?;
         for (k, v) in res {
             env.set(&k, &v);
         }

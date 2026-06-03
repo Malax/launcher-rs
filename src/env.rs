@@ -38,6 +38,31 @@ pub const LAUNCH_ENV_EXCLUDELIST: &[&str] = &[
     "CNB_DEPRECATION_MODE",
 ];
 
+#[derive(Debug)]
+pub enum LaunchEnvError {
+    Canonicalize { path: String, error: std::io::Error },
+    ListDir { path: String, error: std::io::Error },
+    ReadFile { path: String, error: std::io::Error },
+}
+
+impl std::fmt::Display for LaunchEnvError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LaunchEnvError::Canonicalize { path, error } => {
+                write!(f, "Canonicalize layer dir '{}': {}", path, error)
+            }
+            LaunchEnvError::ListDir { path, error } => {
+                write!(f, "List env dir '{}': {}", path, error)
+            }
+            LaunchEnvError::ReadFile { path, error } => {
+                write!(f, "Read env file '{}': {}", path, error)
+            }
+        }
+    }
+}
+
+impl std::error::Error for LaunchEnvError {}
+
 /// Encapsulates the execution environment variables and layer-sourcing modifications for the launch process.
 pub struct LaunchEnv {
     vars: HashMap<String, String>,
@@ -91,9 +116,12 @@ impl LaunchEnv {
     }
 
     /// Appends a root layer path to standard PATH and LD_LIBRARY_PATH variables.
-    pub fn add_root_dir(&mut self, layer_dir: &str) -> Result<(), String> {
+    pub fn add_root_dir(&mut self, layer_dir: &str) -> Result<(), LaunchEnvError> {
         let abs_dir = fs::canonicalize(layer_dir)
-            .map_err(|e| format!("Canonicalize layer dir '{}': {}", layer_dir, e))?;
+            .map_err(|e| LaunchEnvError::Canonicalize {
+                path: layer_dir.to_string(),
+                error: e,
+            })?;
 
         for (sub_dir, var_name) in &self.root_dir_map {
             let child_dir = abs_dir.join(sub_dir);
@@ -117,20 +145,27 @@ impl LaunchEnv {
     }
 
     /// Processes a directory containing environment files and applies them sequentially.
-    pub fn add_env_dir(&mut self, env_dir: &str, default_action: ActionType) -> Result<(), String> {
+    pub fn add_env_dir(&mut self, env_dir: &str, default_action: ActionType) -> Result<(), LaunchEnvError> {
         let path = Path::new(env_dir);
         if !path.is_dir() {
             return Ok(());
         }
 
-        let entries =
-            fs::read_dir(path).map_err(|e| format!("List env dir '{}': {}", env_dir, e))?;
+        let entries = fs::read_dir(path).map_err(|e| LaunchEnvError::ListDir {
+            path: env_dir.to_string(),
+            error: e,
+        })?;
 
         let mut files: Vec<_> = entries
             .filter_map(|entry_res| {
                 let entry = match entry_res {
                     Ok(e) => e,
-                    Err(err) => return Some(Err(err.to_string())),
+                    Err(err) => {
+                        return Some(Err(LaunchEnvError::ListDir {
+                            path: env_dir.to_string(),
+                            error: err,
+                        }))
+                    }
                 };
                 match fs::metadata(entry.path()) {
                     Ok(meta) if meta.is_dir() => None,
@@ -138,7 +173,7 @@ impl LaunchEnv {
                     Err(_) => None,
                 }
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, LaunchEnvError>>()?;
         files.sort_by_key(|f| f.file_name());
 
         for file in files {
@@ -148,8 +183,10 @@ impl LaunchEnv {
             };
             let file_path = file.path();
 
-            let v = fs::read_to_string(&file_path)
-                .map_err(|e| format!("Read env file '{}': {}", file_path.display(), e))?;
+            let v = fs::read_to_string(&file_path).map_err(|e| LaunchEnvError::ReadFile {
+                path: file_path.to_string_lossy().into_owned(),
+                error: e,
+            })?;
 
             // Read custom delimiter if present
             let delim_path = Path::new(env_dir).join(format!("{}.delim", name));
