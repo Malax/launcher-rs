@@ -1,0 +1,133 @@
+name: build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo Dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format Check
+        run: cargo fmt --check
+
+      - name: Clippy Lint
+        run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Test - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo Dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Tests
+        run: cargo test --verbose
+
+  test-s390x:
+    name: Test - s390x (QEMU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Tests on s390x via QEMU
+        uses: uraimo/run-on-arch-action@v2
+        with:
+          arch: s390x
+          distro: ubuntu24.04
+          githubToken: ${{ github.token }}
+          setup: |
+            mkdir -p "${{ github.workspace }}/.cargo"
+          run: |
+            apt-get update && apt-get install -y curl build-essential
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+            source "$HOME/.cargo/env"
+            cargo test --verbose
+
+  build-and-package:
+    name: Build & Package - ${{ matrix.target }}
+    needs: [check, test, test-s390x]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+          - target: s390x-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo Dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Cross-Compilation Toolchains
+        if: matrix.os == 'ubuntu-latest'
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build Release Binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package Tarball (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/launcher dist/launcher
+          tar -C dist -czf launcher-${{ matrix.target }}.tgz launcher
+          sha256sum launcher-${{ matrix.target }}.tgz > launcher-${{ matrix.target }}.tgz.sha256
+
+      - name: Package Zip (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist
+          Copy-Item -Path target\${{ matrix.target }}\release\launcher.exe -Destination dist\launcher.exe
+          Compress-Archive -Path dist\launcher.exe -DestinationPath launcher-${{ matrix.target }}.zip -Force
+          $sha = (Get-FileHash -Path launcher-${{ matrix.target }}.zip -Algorithm SHA256).Hash.ToLower()
+          "$sha  launcher-${{ matrix.target }}.zip" | Out-File -FilePath launcher-${{ matrix.target }}.zip.sha256 -Encoding ascii
+
+      - name: Upload Binary Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: launcher-${{ matrix.target }}
+          path: |
+            launcher-${{ matrix.target }}.*
