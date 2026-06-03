@@ -2,14 +2,20 @@ use crate::env::LaunchEnv;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
-use std::os::unix::io::AsRawFd;
-use std::os::unix::io::FromRawFd;
-use std::os::unix::io::IntoRawFd;
-use std::os::unix::process::CommandExt;
 use std::process::Command;
+
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::io::FromRawFd;
+#[cfg(unix)]
+use std::os::unix::io::IntoRawFd;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 /// Executes the executable at the given path, capturing environment variables written to File Descriptor 3.
 /// The executable should implement the exec.d interface, writing TOML key-value pairs to FD 3.
+#[cfg(unix)]
 pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>, String> {
     let (reader_fd, writer_fd) =
         rustix::pipe::pipe().map_err(|e| format!("Failed to create OS pipe: {}", e))?;
@@ -82,7 +88,114 @@ pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>
     Ok(env_vars)
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+mod win32 {
+    use std::ffi::c_void;
+
+    pub type HANDLE = *mut c_void;
+    pub type BOOL = i32;
+    pub type DWORD = u32;
+
+    #[repr(C)]
+    pub struct SECURITY_ATTRIBUTES {
+        pub nLength: DWORD,
+        pub lpSecurityDescriptor: *mut c_void,
+        pub bInheritHandle: BOOL,
+    }
+
+    extern "system" {
+        pub fn CreatePipe(
+            hReadPipe: *mut HANDLE,
+            hWritePipe: *mut HANDLE,
+            lpPipeAttributes: *mut SECURITY_ATTRIBUTES,
+            nSize: DWORD,
+        ) -> BOOL;
+    }
+}
+
+/// Executes the executable at the given path on Windows, capturing environment variables
+/// written to the inherited pipe handle specified by CNB_EXEC_D_HANDLE.
+#[cfg(windows)]
+pub fn run_exec_d(path: &str, env: &LaunchEnv) -> Result<HashMap<String, String>, String> {
+    use std::os::windows::io::{FromRawHandle, AsRawHandle};
+    use std::process::Stdio;
+
+    let mut read_handle: win32::HANDLE = std::ptr::null_mut();
+    let mut write_handle: win32::HANDLE = std::ptr::null_mut();
+
+    let mut sa = win32::SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<win32::SECURITY_ATTRIBUTES>() as win32::DWORD,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: 1, // TRUE
+    };
+
+    let res = unsafe {
+        win32::CreatePipe(
+            &mut read_handle,
+            &mut write_handle,
+            &mut sa,
+            0,
+        )
+    };
+
+    if res == 0 {
+        return Err("Failed to create Win32 pipe".to_string());
+    }
+
+    // Convert raw handles into Rust File objects
+    let reader: File = unsafe { File::from_raw_handle(read_handle) };
+    let writer: File = unsafe { File::from_raw_handle(write_handle) };
+
+    let write_handle_val = writer.as_raw_handle();
+    let handle_hex = format!("{:#x}", write_handle_val as usize);
+
+    let mut cmd = Command::new(path);
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
+
+    // Inject CNB_EXEC_D_HANDLE variable
+    let mut child_env = env.vars().clone();
+    child_env.insert("CNB_EXEC_D_HANDLE".to_string(), handle_hex);
+    cmd.envs(&child_env);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn exec.d binary '{}': {}", path, e))?;
+
+    // Close parent's copy of writer
+    drop(writer);
+
+    let mut toml_output = String::new();
+    let mut r = reader;
+    r.read_to_string(&mut toml_output)
+        .map_err(|e| format!("Failed to read handle output from exec.d: {}", e))?;
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait for exec.d child process: {}", e))?;
+
+    if !status.success() {
+        return Err(format!(
+            "exec.d binary '{}' failed with status: {}",
+            path, status
+        ));
+    }
+
+    if toml_output.trim().is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let env_vars: HashMap<String, String> = toml::from_str(&toml_output).map_err(|e| {
+        format!(
+            "Failed to decode TOML output from exec.d binary '{}': {}\nOutput: '{}'",
+            path, e, toml_output
+        )
+    })?;
+
+    Ok(env_vars)
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::fs;

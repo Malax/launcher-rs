@@ -7,16 +7,38 @@ pub mod shell;
 
 use env::{ActionType, LaunchEnv};
 use exit::ExitCode;
-use launch::{RawMetadata, ResolvedProcess, resolve_process};
-use shell::{BashShell, Shell, ShellProcess};
+use launch::RawMetadata;
+#[cfg(unix)]
+use shell::BashShell;
+#[cfg(windows)]
+use shell::CmdShell;
+use shell::{Shell, ShellProcess};
 use std::fs;
 use std::io::IsTerminal;
 use std::path::Path;
 
 const DEFAULT_PLATFORM_API: &str = ""; // match Go's empty default
-const DEFAULT_LAYERS_DIR: &str = "/layers";
-const DEFAULT_APP_DIR: &str = "/workspace";
 const DEFAULT_EXEC_ENV: &str = "production";
+
+#[cfg(target_family = "unix")]
+const DEFAULT_LAYERS_DIR: &str = "/layers";
+#[cfg(target_family = "unix")]
+const DEFAULT_APP_DIR: &str = "/workspace";
+
+#[cfg(target_family = "windows")]
+const DEFAULT_LAYERS_DIR: &str = "c:\\layers";
+#[cfg(target_family = "windows")]
+const DEFAULT_APP_DIR: &str = "c:\\workspace";
+
+#[cfg(target_family = "unix")]
+pub const CNB_PROCESS_DIR: &str = "/cnb/process";
+#[cfg(target_family = "windows")]
+pub const CNB_PROCESS_DIR: &str = "c:\\cnb\\process";
+
+#[cfg(target_family = "unix")]
+pub const CNB_LIFECYCLE_DIR: &str = "/cnb/lifecycle";
+#[cfg(target_family = "windows")]
+pub const CNB_LIFECYCLE_DIR: &str = "c:\\cnb\\lifecycle";
 
 fn should_enable_color() -> bool {
     if let Ok(no_color) = std::env::var("CNB_NO_COLOR") {
@@ -138,23 +160,27 @@ fn run_launcher() -> Result<(), LaunchError> {
 
     // 5. Gather CLI Arguments
     let args: Vec<String> = std::env::args().collect();
-    let user_args = if args.len() > 1 {
-        args[1..].to_vec()
-    } else {
-        Vec::new()
+
+    // 6. Select the target process
+    let selector = launch::ProcessSelector {
+        args: &args,
+        metadata: &metadata,
+        platform_api: &platform_api,
+        exec_env: &exec_env,
+        app_dir: &app_dir,
     };
 
-    // 6. Determine process type based on argv[0]
     let argv0 = args
         .first()
         .cloned()
         .unwrap_or_else(|| "launcher".to_string());
+
+    // If they aren't using a symlink, check if they used the deprecated env variable
     let argv0_file_name = Path::new(&argv0)
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "launcher".to_string());
 
-    // Default exec extension stripping (like .exe on windows, empty on unix)
     let process_name = if cfg!(windows) {
         argv0_file_name
             .strip_suffix(".exe")
@@ -164,20 +190,7 @@ fn run_launcher() -> Result<(), LaunchError> {
         argv0_file_name
     };
 
-    let mut default_process_type = String::new();
-    if process_name != "launcher" {
-        // If argv0 is not "launcher", check if it matches a buildpack process type
-        if metadata
-            .processes
-            .iter()
-            .any(|p| p.proc_type == process_name)
-        {
-            default_process_type = process_name;
-        }
-    }
-
-    // If default process type is not resolved from argv0, check CNB_PROCESS_TYPE for warnings
-    if default_process_type.is_empty() {
+    if process_name == "launcher" {
         if let Ok(p_type) = std::env::var("CNB_PROCESS_TYPE") {
             if !p_type.trim().is_empty() {
                 print_warning(&format!(
@@ -192,97 +205,13 @@ fn run_launcher() -> Result<(), LaunchError> {
         }
     }
 
-    // 7. Resolve target process
-    let resolved_process = if !default_process_type.is_empty() {
-        // Find raw process matching default_process_type
-        let raw_proc = metadata
-            .processes
-            .iter()
-            .find(|p| p.proc_type == default_process_type)
-            .ok_or_else(|| {
-                LaunchError::new(
-                    format!("process type '{}' was not found", default_process_type),
-                    ExitCode::LaunchError,
-                )
-            })?;
-
-        resolve_process(
-            raw_proc,
-            &metadata.buildpacks,
-            &platform_api,
-            &exec_env,
-            &user_args,
-        )
-        .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?
-        .ok_or_else(|| {
-            LaunchError::new(
-                format!(
-                    "process type '{}' is not eligible for execution environment '{}'",
-                    default_process_type, exec_env
-                ),
-                ExitCode::LaunchError,
-            )
-        })?
-    } else {
-        // If argv0 was launcher, then user args determine the target
-        if user_args.is_empty() {
-            // Find default process in metadata
-            if let Some(raw_proc) = metadata.processes.iter().find(|p| p.default) {
-                resolve_process(
-                    raw_proc,
-                    &metadata.buildpacks,
-                    &platform_api,
-                    &exec_env,
-                    &[],
-                )
-                .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?
-                .ok_or_else(|| {
-                    LaunchError::new(
-                        "Default process is not eligible for execution environment".to_string(),
-                        ExitCode::LaunchError,
-                    )
-                })?
-            } else {
-                return Err(LaunchError::new(
-                    "determine start command: when there is no default process a command is required".to_string(),
-                    ExitCode::LaunchError,
-                ));
-            }
-        } else {
-            // If the first argument matches a process type (legacy fallback or platform behavior check)
-            if let Some(raw_proc) = metadata
-                .processes
-                .iter()
-                .find(|p| p.proc_type == user_args[0])
-            {
-                resolve_process(
-                    raw_proc,
-                    &metadata.buildpacks,
-                    &platform_api,
-                    &exec_env,
-                    &user_args[1..],
-                )
-                .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?
-                .ok_or_else(|| {
-                    LaunchError::new(
-                        format!("Process type '{}' is not eligible", user_args[0]),
-                        ExitCode::LaunchError,
-                    )
-                })?
-            } else {
-                // Parse user-provided custom command
-                ResolvedProcess::user_provided(&user_args, &app_dir)
-                    .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?
-            }
-        }
-    };
+    let resolved_process = selector
+        .select()
+        .map_err(|e| LaunchError::new(e, ExitCode::LaunchError))?;
 
     // 8. Prepare Launch Environment
     let host_envs: Vec<(String, String)> = std::env::vars().collect();
-    let process_dir = "/cnb/process";
-    let lifecycle_dir = "/cnb/lifecycle";
-
-    let mut env = LaunchEnv::new(&host_envs, process_dir, lifecycle_dir);
+    let mut env = LaunchEnv::new(&host_envs, CNB_PROCESS_DIR, CNB_LIFECYCLE_DIR);
 
     // Apply layers sequential modifications
     for bp in &metadata.buildpacks {
@@ -292,21 +221,8 @@ fn run_launcher() -> Result<(), LaunchError> {
         }
 
         // List and sort layer subdirectories alphabetically ascending
-        let entries = fs::read_dir(&bp_dir).map_err(|e| {
-            LaunchError::new(
-                format!("List layers for buildpack '{}': {}", bp.id, e),
-                ExitCode::LaunchError,
-            )
-        })?;
-
-        let mut layer_dirs = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| LaunchError::new(e.to_string(), ExitCode::LaunchError))?;
-            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                layer_dirs.push(entry.path());
-            }
-        }
-        layer_dirs.sort();
+        let layer_dirs =
+            read_layer_dirs(&bp_dir, &format!("List layers for buildpack '{}'", bp.id))?;
 
         // 1. Add layer roots to path variables
         for ldir in &layer_dirs {
@@ -344,18 +260,7 @@ fn run_launcher() -> Result<(), LaunchError> {
             continue;
         }
 
-        let entries = fs::read_dir(&bp_dir).map_err(|e| {
-            LaunchError::new(format!("List layers for exec.d: {}", e), ExitCode::LaunchError)
-        })?;
-
-        let mut layer_dirs = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|e| LaunchError::new(e.to_string(), ExitCode::LaunchError))?;
-            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                layer_dirs.push(entry.path());
-            }
-        }
-        layer_dirs.sort();
+        let layer_dirs = read_layer_dirs(&bp_dir, "List layers for exec.d")?;
 
         for ldir in &layer_dirs {
             let exec_d_dir = ldir.join("exec.d");
@@ -393,22 +298,7 @@ fn run_launcher() -> Result<(), LaunchError> {
                 continue;
             }
 
-            let entries = fs::read_dir(&bp_dir).map_err(|e| {
-                LaunchError::new(
-                    format!("List layers for profile.d: {}", e),
-                    ExitCode::LaunchError,
-                )
-            })?;
-
-            let mut layer_dirs = Vec::new();
-            for entry in entries {
-                let entry =
-                    entry.map_err(|e| LaunchError::new(e.to_string(), ExitCode::LaunchError))?;
-                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                    layer_dirs.push(entry.path());
-                }
-            }
-            layer_dirs.sort();
+            let layer_dirs = read_layer_dirs(&bp_dir, "List layers for profile.d")?;
 
             for ldir in &layer_dirs {
                 let profile_d_dir = ldir.join("profile.d");
@@ -425,8 +315,13 @@ fn run_launcher() -> Result<(), LaunchError> {
             }
         }
 
-        // Add app .profile if it exists and is not a directory
-        let app_profile_path = Path::new(&app_dir).join(".profile");
+        // Add app profile if it exists and is not a directory
+        let profile_name = if cfg!(windows) {
+            ".profile.bat"
+        } else {
+            ".profile"
+        };
+        let app_profile_path = Path::new(&app_dir).join(profile_name);
         if app_profile_path.is_file() {
             profiles.push(app_profile_path.to_string_lossy().into_owned());
         }
@@ -441,8 +336,12 @@ fn run_launcher() -> Result<(), LaunchError> {
             working_directory: resolved_process.working_directory.clone(),
         };
 
-        let bash_shell = BashShell;
-        if let Err(err) = bash_shell.launch(shell_proc) {
+        #[cfg(unix)]
+        let shell = BashShell;
+        #[cfg(windows)]
+        let shell = CmdShell;
+
+        if let Err(err) = shell.launch(shell_proc) {
             return Err(LaunchError::new(
                 format!("bash exec: {}", err),
                 ExitCode::LaunchError,
@@ -452,22 +351,64 @@ fn run_launcher() -> Result<(), LaunchError> {
     }
 }
 
+fn read_layer_dirs<P: AsRef<Path>>(
+    bp_dir: P,
+    error_context: &str,
+) -> Result<Vec<std::path::PathBuf>, LaunchError> {
+    let entries = fs::read_dir(bp_dir).map_err(|e| {
+        LaunchError::new(format!("{}: {}", error_context, e), ExitCode::LaunchError)
+    })?;
+
+    let mut dirs = entries
+        .map(|res| res.map_err(|e| LaunchError::new(e.to_string(), ExitCode::LaunchError)))
+        .filter_map(|res| match res {
+            Ok(entry) => {
+                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    Some(Ok(entry.path()))
+                } else {
+                    None
+                }
+            }
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<Result<Vec<_>, LaunchError>>()?;
+
+    dirs.sort();
+    Ok(dirs)
+}
+
+fn read_layer_files<P: AsRef<Path>>(
+    dir: P,
+    error_context: &str,
+) -> Result<Vec<std::path::PathBuf>, LaunchError> {
+    let entries = fs::read_dir(dir).map_err(|e| {
+        LaunchError::new(format!("{}: {}", error_context, e), ExitCode::LaunchError)
+    })?;
+
+    let mut files = entries
+        .map(|res| res.map_err(|e| LaunchError::new(e.to_string(), ExitCode::LaunchError)))
+        .filter_map(|res| match res {
+            Ok(entry) => {
+                if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                    Some(Ok(entry.path()))
+                } else {
+                    None
+                }
+            }
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<Result<Vec<_>, LaunchError>>()?;
+
+    files.sort();
+    Ok(files)
+}
+
 fn escape_id(id: &str) -> String {
     id.replace('/', "_")
 }
 
 fn run_exec_d_in_dir(dir: &Path, env: &mut LaunchEnv) -> Result<(), LaunchError> {
-    let entries = fs::read_dir(dir)
-        .map_err(|e| LaunchError::new(format!("List exec.d dir: {}", e), ExitCode::LaunchError))?;
-
-    let mut files = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| LaunchError::new(e.to_string(), ExitCode::LaunchError))?;
-        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-            files.push(entry.path());
-        }
-    }
-    files.sort();
+    let files = read_layer_files(dir, "List exec.d dir")?;
 
     for file in files {
         let file_str = file.to_string_lossy();
@@ -481,17 +422,7 @@ fn run_exec_d_in_dir(dir: &Path, env: &mut LaunchEnv) -> Result<(), LaunchError>
 }
 
 fn accumulate_files_in_dir(dir: &Path, list: &mut Vec<String>) -> Result<(), LaunchError> {
-    let entries = fs::read_dir(dir)
-        .map_err(|e| LaunchError::new(format!("List profile.d dir: {}", e), ExitCode::LaunchError))?;
-
-    let mut files = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| LaunchError::new(e.to_string(), ExitCode::LaunchError))?;
-        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-            files.push(entry.path());
-        }
-    }
-    files.sort();
+    let files = read_layer_files(dir, "List profile.d dir")?;
 
     for file in files {
         list.push(file.to_string_lossy().into_owned());

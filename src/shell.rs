@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::process::Command;
 
@@ -61,6 +62,45 @@ impl Shell for BashShell {
 
         let err = cmd.exec();
         Err(err)
+    }
+}
+
+/// A Windows Command Prompt-based shell executor.
+/// Sourced batch profile scripts and spawns the target process.
+#[cfg(windows)]
+pub struct CmdShell;
+
+#[cfg(windows)]
+impl Shell for CmdShell {
+    fn launch(&self, proc: ShellProcess) -> Result<(), std::io::Error> {
+        use std::process::Command;
+
+        let mut command_tokens = Vec::new();
+        for profile in &proc.profiles {
+            command_tokens.push("call".to_string());
+            command_tokens.push(profile.clone());
+            command_tokens.push("&&".to_string());
+        }
+        command_tokens.push("cd".to_string());
+        command_tokens.push("/d".to_string());
+        command_tokens.push(proc.working_directory.clone());
+        command_tokens.push("&&".to_string());
+        command_tokens.push(proc.command.clone());
+        command_tokens.extend(proc.args.clone());
+
+        let mut cmd = Command::new("cmd");
+        cmd.arg("/q");
+        cmd.arg("/v:on");
+        cmd.arg("/s");
+        cmd.arg("/c");
+        cmd.args(&command_tokens);
+
+        cmd.env_clear();
+        cmd.envs(&proc.env);
+
+        let mut child = cmd.spawn()?;
+        let status = child.wait()?;
+        std::process::exit(status.code().unwrap_or(0));
     }
 }
 

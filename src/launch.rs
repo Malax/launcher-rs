@@ -1,7 +1,6 @@
 use crate::api::Version;
 use crate::env::LaunchEnv;
 use serde::Deserialize;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -102,9 +101,11 @@ impl ResolvedProcess {
     }
 
     /// Launches a process directly (without a shell) using Unix process replacement.
+    #[cfg(unix)]
     pub fn launch_direct(&self, env: &LaunchEnv) -> Result<(), std::io::Error> {
-        let path_val = env.get("PATH").cloned().unwrap_or_default();
+        use std::os::unix::process::CommandExt;
 
+        let path_val = env.get("PATH").cloned().unwrap_or_default();
 
         // Find the absolute path to the command
         let binary_path = which::which_in(&self.command, Some(&path_val), &std::env::current_dir()?)
@@ -125,6 +126,90 @@ impl ResolvedProcess {
 
         let err = cmd.exec();
         Err(err)
+    }
+
+    /// Launches a process directly (without a shell) on Windows.
+    #[cfg(windows)]
+    pub fn launch_direct(&self, env: &LaunchEnv) -> Result<(), std::io::Error> {
+        let path_val = env.get("PATH").cloned().unwrap_or_default();
+
+        // Find the absolute path to the command
+        let binary_path = which::which_in(&self.command, Some(&path_val), &std::env::current_dir()?)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::NotFound, format!("Path lookup failed for '{}': {}", self.command, e)))?;
+
+        // Change directory to the process working directory
+        let work_dir = if self.working_directory.is_empty() {
+            Path::new(".")
+        } else {
+            Path::new(&self.working_directory)
+        };
+        std::env::set_current_dir(work_dir)?;
+
+        let mut cmd = Command::new(binary_path);
+        cmd.args(&self.args);
+        cmd.env_clear();
+        cmd.envs(env.vars());
+
+        let mut child = cmd.spawn()?;
+        let status = child.wait()?;
+        std::process::exit(status.code().unwrap_or(0));
+    }
+}
+
+pub struct ProcessSelector<'a> {
+    pub args: &'a [String],
+    pub metadata: &'a RawMetadata,
+    pub platform_api: &'a crate::api::Version,
+    pub exec_env: &'a str,
+    pub app_dir: &'a str,
+}
+
+impl<'a> ProcessSelector<'a> {
+    pub fn select(self) -> Result<ResolvedProcess, String> {
+        let argv0 = self.args.first().map(|s| s.as_str()).unwrap_or("launcher");
+        
+        let argv0_file_name = std::path::Path::new(argv0)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "launcher".to_string());
+
+        let process_name = if cfg!(windows) {
+            argv0_file_name.strip_suffix(".exe").unwrap_or(&argv0_file_name).to_string()
+        } else {
+            argv0_file_name
+        };
+
+        let user_args = if self.args.len() > 1 {
+            self.args[1..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        // Rule 1: argv0 matches a process type (e.g. symlink)
+        if process_name != "launcher" {
+            if let Some(raw_proc) = self.metadata.processes.iter().find(|p| p.proc_type == process_name) {
+                return resolve_process(raw_proc, &self.metadata.buildpacks, self.platform_api, self.exec_env, &user_args)?
+                    .ok_or_else(|| format!("process type '{}' is not eligible for execution environment '{}'", process_name, self.exec_env));
+            }
+        }
+
+        if user_args.is_empty() {
+            // Rule 2: Default process from metadata
+            if let Some(raw_proc) = self.metadata.processes.iter().find(|p| p.default) {
+                return resolve_process(raw_proc, &self.metadata.buildpacks, self.platform_api, self.exec_env, &[])?
+                    .ok_or_else(|| "Default process is not eligible for execution environment".to_string());
+            }
+            return Err("determine start command: when there is no default process a command is required".to_string());
+        }
+
+        // Rule 3: user_args[0] matches a process type (fallback mechanism)
+        if let Some(raw_proc) = self.metadata.processes.iter().find(|p| p.proc_type == user_args[0]) {
+            return resolve_process(raw_proc, &self.metadata.buildpacks, self.platform_api, self.exec_env, &user_args[1..])?
+                .ok_or_else(|| format!("Process type '{}' is not eligible", user_args[0]));
+        }
+
+        // Rule 4: Custom user-provided command
+        ResolvedProcess::user_provided(&user_args, self.app_dir)
     }
 }
 
@@ -376,5 +461,96 @@ mod tests {
         assert!(resolve_process(&raw_prod, &buildpacks, &plat_15, "production", &[]).unwrap().is_some());
         assert!(resolve_process(&raw_prod, &buildpacks, &plat_15, "test", &[]).unwrap().is_none());
         assert!(resolve_process(&raw_prod, &buildpacks, &plat_15, "", &[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_process_selector() {
+        let raw_web = RawProcess {
+            proc_type: "web".to_string(),
+            command: RawCommand::Single("node".to_string()),
+            args: Some(vec!["server.js".to_string()]),
+            direct: true,
+            default: true,
+            buildpack_id: "my-bp".to_string(),
+            working_dir: None,
+            exec_env: None,
+        };
+
+        let raw_worker = RawProcess {
+            proc_type: "worker".to_string(),
+            command: RawCommand::Single("node".to_string()),
+            args: Some(vec!["worker.js".to_string()]),
+            direct: true,
+            default: false,
+            buildpack_id: "my-bp".to_string(),
+            working_dir: None,
+            exec_env: None,
+        };
+
+        let metadata = RawMetadata {
+            processes: vec![raw_web, raw_worker],
+            buildpacks: vec![RawBuildpack {
+                id: "my-bp".to_string(),
+                api: "0.12".to_string(),
+            }],
+        };
+
+        let platform_api = Version::new(0, 15);
+
+        // Rule 1: argv0 matches process type (symlink execution)
+        let selector = ProcessSelector {
+            args: &[
+                "/usr/local/bin/worker".to_string(), // argv0
+                "--flag".to_string(),                // user args
+            ],
+            metadata: &metadata,
+            platform_api: &platform_api,
+            exec_env: "test",
+            app_dir: "/workspace",
+        };
+        let res = selector.select().unwrap();
+        assert_eq!(res.proc_type, "worker");
+        assert_eq!(res.args, vec!["--flag".to_string()]); // API >= 0.9 user args replace default args
+
+        // Rule 2: Default process (argv0 is launcher, no user args)
+        let selector = ProcessSelector {
+            args: &["launcher".to_string()],
+            metadata: &metadata,
+            platform_api: &platform_api,
+            exec_env: "test",
+            app_dir: "/workspace",
+        };
+        let res = selector.select().unwrap();
+        assert_eq!(res.proc_type, "web"); // web is default
+
+        // Rule 3: user_args[0] matches process type
+        let selector = ProcessSelector {
+            args: &[
+                "launcher".to_string(),
+                "worker".to_string(), // user args[0]
+            ],
+            metadata: &metadata,
+            platform_api: &platform_api,
+            exec_env: "test",
+            app_dir: "/workspace",
+        };
+        let res = selector.select().unwrap();
+        assert_eq!(res.proc_type, "worker");
+
+        // Rule 4: Custom user-provided command
+        let selector = ProcessSelector {
+            args: &[
+                "launcher".to_string(),
+                "python".to_string(),
+                "script.py".to_string(),
+            ],
+            metadata: &metadata,
+            platform_api: &platform_api,
+            exec_env: "test",
+            app_dir: "/workspace",
+        };
+        let res = selector.select().unwrap();
+        assert_eq!(res.command, "python");
+        assert_eq!(res.args, vec!["script.py".to_string()]);
     }
 }
