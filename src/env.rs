@@ -87,8 +87,10 @@ impl LaunchEnv {
         if let Some(path_val) = vars.get("PATH").cloned() {
             let parts = std::env::split_paths(&path_val);
             let mut stripped = Vec::new();
+            let proc_path = Path::new(process_dir);
+            let lc_path = Path::new(lifecycle_dir);
             for part in parts {
-                if part.to_str() == Some(process_dir) || part.to_str() == Some(lifecycle_dir) {
+                if part == proc_path || part == lc_path {
                     continue;
                 }
                 stripped.push(part);
@@ -474,5 +476,31 @@ mod tests {
             ),
             Some(expected.to_string())
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_new_launch_env_purging_mixed_slashes_windows() {
+        let host_env = vec![(
+            "PATH".to_string(),
+            r"\lifecycle;C:\process;C:\usr\bin".to_string(),
+        )];
+        // Mixed slash input: forward slash in process_dir and lifecycle_dir
+        let env = LaunchEnv::new(&host_env, "C:/process", "/lifecycle");
+
+        assert_eq!(env.get("PATH").unwrap(), r"C:\usr\bin");
+    }
+
+    #[test]
+    fn test_new_launch_env_purging_trailing_slashes() {
+        let path_val = if cfg!(windows) {
+            "/lifecycle/;/process/;/usr/bin"
+        } else {
+            "/lifecycle/:/process/:/usr/bin"
+        };
+        let host_env = vec![("PATH".to_string(), path_val.to_string())];
+        let env = LaunchEnv::new(&host_env, "/process", "/lifecycle");
+
+        assert_eq!(env.get("PATH").unwrap(), "/usr/bin");
     }
 }
