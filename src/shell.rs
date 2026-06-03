@@ -73,8 +73,6 @@ pub struct CmdShell;
 #[cfg(windows)]
 impl Shell for CmdShell {
     fn launch(&self, proc: ShellProcess) -> Result<(), std::io::Error> {
-        use std::process::Command;
-
         let mut command_tokens = Vec::new();
         for profile in &proc.profiles {
             command_tokens.push("call".to_string());

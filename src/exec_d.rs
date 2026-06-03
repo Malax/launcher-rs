@@ -162,6 +162,7 @@ pub fn run_exec_d<P: AsRef<Path>>(
 }
 
 #[cfg(windows)]
+#[allow(non_snake_case)]
 mod win32 {
     use std::ffi::c_void;
 
@@ -176,7 +177,7 @@ mod win32 {
         pub bInheritHandle: BOOL,
     }
 
-    extern "system" {
+    unsafe extern "system" {
         pub fn CreatePipe(
             hReadPipe: *mut HANDLE,
             hWritePipe: *mut HANDLE,
