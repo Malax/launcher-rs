@@ -107,12 +107,22 @@ jobs:
       - name: Build Release Binary
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0
+
       - name: Package Tarball (Linux)
         if: matrix.os == 'ubuntu-latest'
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/launcher dist/launcher
-          tar -C dist -czf launcher-${{ matrix.target }}.tgz launcher
+          syft dist/launcher -o json=dist/launcher.sbom.syft.json
+          syft dist/launcher -o spdx-json=dist/launcher.sbom.spdx.json
+          syft dist/launcher -o cyclonedx-json=dist/launcher.sbom.cdx.json
+          tar -C dist -czf launcher-${{ matrix.target }}.tgz \
+            launcher \
+            launcher.sbom.syft.json \
+            launcher.sbom.spdx.json \
+            launcher.sbom.cdx.json
           sha256sum launcher-${{ matrix.target }}.tgz > launcher-${{ matrix.target }}.tgz.sha256
 
       - name: Package Zip (Windows)
@@ -121,7 +131,10 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist
           Copy-Item -Path target\${{ matrix.target }}\release\launcher.exe -Destination dist\launcher.exe
-          Compress-Archive -Path dist\launcher.exe -DestinationPath launcher-${{ matrix.target }}.zip -Force
+          syft dist\launcher.exe -o json=dist\launcher.sbom.syft.json
+          syft dist\launcher.exe -o spdx-json=dist\launcher.sbom.spdx.json
+          syft dist\launcher.exe -o cyclonedx-json=dist\launcher.sbom.cdx.json
+          Compress-Archive -Path dist\launcher.exe, dist\launcher.sbom.syft.json, dist\launcher.sbom.spdx.json, dist\launcher.sbom.cdx.json -DestinationPath launcher-${{ matrix.target }}.zip -Force
           $sha = (Get-FileHash -Path launcher-${{ matrix.target }}.zip -Algorithm SHA256).Hash.ToLower()
           "$sha  launcher-${{ matrix.target }}.zip" | Out-File -FilePath launcher-${{ matrix.target }}.zip.sha256 -Encoding ascii
 
@@ -131,3 +144,40 @@ jobs:
           name: launcher-${{ matrix.target }}
           path: |
             launcher-${{ matrix.target }}.*
+
+  sbom:
+    name: Generate Source SBOM
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set Version Env
+        run: |
+          version=$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)
+          echo "VERSION=$version" >> $GITHUB_ENV
+
+      - name: Install cargo-cyclonedx
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-cyclonedx
+
+      - name: Generate SBOM JSON
+        run: |
+          cargo cyclonedx --spec-version 1.5 --format json --override-filename launcher-v${{ env.VERSION }}-bom.cdx
+
+      - name: Calculate SBOM sha256
+        run: |
+          shasum -a 256 launcher-v${{ env.VERSION }}-bom.cdx.json > launcher-v${{ env.VERSION }}-bom.cdx.json.sha256
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: launcher-bom-cdx
+          path: launcher-v${{ env.VERSION }}-bom.cdx.json
+
+      - name: Upload SBOM sha256
+        uses: actions/upload-artifact@v4
+        with:
+          name: launcher-bom-cdx-sha256
+          path: launcher-v${{ env.VERSION }}-bom.cdx.json.sha256
