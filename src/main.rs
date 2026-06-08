@@ -503,24 +503,16 @@ fn read_layer_dirs<P: AsRef<Path>>(
         error: e,
     })?;
 
-    let mut dirs = entries
-        .map(|res| {
-            res.map_err(|e| LaunchError::ListLayerDirs {
-                context: error_context.to_string(),
-                error: e,
-            })
-        })
-        .filter_map(|res| match res {
-            Ok(entry) => {
-                if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                    Some(Ok(entry.path()))
-                } else {
-                    None
-                }
-            }
-            Err(e) => Some(Err(e)),
-        })
-        .collect::<Result<Vec<_>, LaunchError>>()?;
+    let mut dirs = Vec::new();
+    for entry_res in entries {
+        let entry = entry_res.map_err(|e| LaunchError::ListLayerDirs {
+            context: error_context.to_string(),
+            error: e,
+        })?;
+        if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            dirs.push(entry.path());
+        }
+    }
 
     dirs.sort();
     Ok(dirs)
@@ -545,24 +537,16 @@ fn read_layer_files<P: AsRef<Path>>(
         error: e,
     })?;
 
-    let mut files = entries
-        .map(|res| {
-            res.map_err(|e| LaunchError::ListLayerFiles {
-                context: error_context.to_string(),
-                error: e,
-            })
-        })
-        .filter_map(|res| match res {
-            Ok(entry) => {
-                if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                    Some(Ok(entry.path()))
-                } else {
-                    None
-                }
-            }
-            Err(e) => Some(Err(e)),
-        })
-        .collect::<Result<Vec<_>, LaunchError>>()?;
+    let mut files = Vec::new();
+    for entry_res in entries {
+        let entry = entry_res.map_err(|e| LaunchError::ListLayerFiles {
+            context: error_context.to_string(),
+            error: e,
+        })?;
+        if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            files.push(entry.path());
+        }
+    }
 
     files.sort();
     Ok(files)

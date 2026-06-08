@@ -419,9 +419,9 @@ impl<'a> ProcessSelector<'a> {
         };
 
         let user_args = if self.args.len() > 1 {
-            self.args[1..].to_vec()
+            &self.args[1..]
         } else {
-            Vec::new()
+            &[]
         };
 
         // Rule 1: argv0 matches a process type (e.g. symlink)
@@ -440,7 +440,7 @@ impl<'a> ProcessSelector<'a> {
                 &self.metadata.buildpacks,
                 self.platform_api,
                 self.exec_env,
-                &user_args,
+                user_args,
             )?
             .ok_or_else(|| ProcessSelectionError::IneligibleProcess {
                 name: process_name.clone(),
@@ -479,7 +479,7 @@ impl<'a> ProcessSelector<'a> {
             })?
         } else {
             // Rule 4: Custom user-provided command
-            return ResolvedProcess::from_user(&user_args, self.app_dir);
+            return ResolvedProcess::from_user(user_args, self.app_dir);
         };
 
         if resolved.working_directory.is_empty() {
