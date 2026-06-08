@@ -99,14 +99,17 @@ impl LaunchEnv {
     /// Creates a new `LaunchEnv` populated from the host environment variables.
     /// Excludes variables defined in `LAUNCH_ENV_EXCLUDELIST` and sanitizes the `PATH`
     /// by stripping out the `process_dir` and `lifecycle_dir` to prevent runtime pollution.
-    pub fn new(environ: &[(String, String)], process_dir: &str, lifecycle_dir: &str) -> Self {
+    pub fn new<I>(environ: I, process_dir: &str, lifecycle_dir: &str) -> Self
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
         let mut vars = HashMap::new();
 
         for (k, v) in environ {
             if LAUNCH_ENV_EXCLUDELIST.contains(&k.as_str()) {
                 continue;
             }
-            vars.insert(k.clone(), v.clone());
+            vars.insert(k, v);
         }
 
         // Sanitize PATH
@@ -188,7 +191,7 @@ impl LaunchEnv {
             error: e,
         })?;
 
-        let mut files: Vec<_> = entries
+        let mut files: Vec<(std::ffi::OsString, std::fs::DirEntry)> = entries
             .filter_map(|entry_res| {
                 let entry = match entry_res {
                     Ok(e) => e,
@@ -201,15 +204,16 @@ impl LaunchEnv {
                 };
                 match fs::metadata(entry.path()) {
                     Ok(meta) if meta.is_dir() => None,
-                    Ok(_) => Some(Ok(entry)),
+                    Ok(_) => Some(Ok((entry.file_name(), entry))),
                     Err(_) => None,
                 }
             })
             .collect::<Result<Vec<_>, LaunchEnvError>>()?;
-        files.sort_by_key(|f| f.file_name());
 
-        for file in files {
-            let file_name = file.file_name().to_string_lossy().into_owned();
+        files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        for (file_name_os, file) in files {
+            let file_name = file_name_os.to_string_lossy().into_owned();
             let Some((name, action)) = parse_env_file_parts(&file_name, default_action) else {
                 continue;
             };
@@ -251,11 +255,10 @@ impl LaunchEnv {
         v: String,
         delim: Option<&str>,
     ) -> Option<String> {
-        let current = self.vars.get(name).cloned().unwrap_or_default();
         match action {
             ActionType::Override => Some(v),
             ActionType::Default => {
-                if current.is_empty() {
+                if self.vars.get(name).map(|s| s.is_empty()).unwrap_or(true) {
                     Some(v)
                 } else {
                     None
@@ -263,12 +266,10 @@ impl LaunchEnv {
             }
             ActionType::Append => {
                 let d = delim.unwrap_or("");
-                let new_val = if current.is_empty() {
-                    v
-                } else {
-                    format!("{}{}{}", current, d, v)
-                };
-                Some(new_val)
+                match self.vars.get(name) {
+                    Some(current) if !current.is_empty() => Some(format!("{}{}{}", current, d, v)),
+                    _ => Some(v),
+                }
             }
             ActionType::Prepend => {
                 let d = delim.unwrap_or_else(|| {
@@ -278,12 +279,10 @@ impl LaunchEnv {
                         ""
                     }
                 });
-                let new_val = if current.is_empty() {
-                    v
-                } else {
-                    format!("{}{}{}", v, d, current)
-                };
-                Some(new_val)
+                match self.vars.get(name) {
+                    Some(current) if !current.is_empty() => Some(format!("{}{}{}", v, d, current)),
+                    _ => Some(v),
+                }
             }
         }
     }
@@ -299,9 +298,10 @@ fn parse_env_file_parts(
     file_name: &str,
     default_action: ActionType,
 ) -> Option<(String, ActionType)> {
-    let parts: Vec<&str> = file_name.splitn(2, '.').collect();
-    let name = parts[0].to_string();
-    let suffix = if parts.len() > 1 { parts[1] } else { "" };
+    let (name, suffix) = match file_name.split_once('.') {
+        Some((n, s)) => (n, s),
+        None => (file_name, ""),
+    };
 
     // Delimiter files are ignored in the main action loop
     if suffix == "delim" {
@@ -313,7 +313,7 @@ fn parse_env_file_parts(
         other => other.parse().ok()?,
     };
 
-    Some((name, action))
+    Some((name.to_string(), action))
 }
 
 #[cfg(test)]
@@ -333,7 +333,7 @@ mod tests {
             ("CNB_APP_DIR".to_string(), "/workspace".to_string()),
             ("FOO".to_string(), "bar".to_string()),
         ];
-        let env = LaunchEnv::new(&host_env, "/process", "/lifecycle");
+        let env = LaunchEnv::new(host_env, "/process", "/lifecycle");
 
         assert!(env.get("CNB_APP_DIR").is_none());
         assert_eq!(env.get("FOO").unwrap(), "bar");
@@ -349,7 +349,7 @@ mod tests {
         fs::write(dir_path.join("FOO"), "unsuffixed_val").unwrap();
         fs::write(dir_path.join("BAR.override"), "override_val").unwrap();
 
-        let mut env = LaunchEnv::new(&[], "", "");
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
         env.set("FOO", "original_foo");
         env.set("BAR", "original_bar");
 
@@ -381,7 +381,7 @@ mod tests {
         fs::write(dir_path.join("VAR.append"), "appendage").unwrap();
         fs::write(dir_path.join("VAR.delim"), "-").unwrap();
 
-        let mut env = LaunchEnv::new(&[], "", "");
+        let mut env = LaunchEnv::new(std::iter::empty(), "", "");
         env.set("PATH", "/usr/bin");
         env.set("VAR", "base");
 
@@ -450,7 +450,7 @@ mod tests {
     fn test_evaluate_env_modifier() {
         use super::{ActionType, LaunchEnv};
 
-        let env = LaunchEnv::new(&[], "", "");
+        let env = LaunchEnv::new(std::iter::empty(), "", "");
 
         // 1. Override
         assert_eq!(
@@ -466,7 +466,7 @@ mod tests {
         );
 
         // When not empty -> None
-        let mut env_with_val = LaunchEnv::new(&[], "", "");
+        let mut env_with_val = LaunchEnv::new(std::iter::empty(), "", "");
         env_with_val.set("BAR", "val1");
         assert_eq!(
             env_with_val.evaluate_env_modifier(
@@ -496,7 +496,7 @@ mod tests {
         );
 
         // 5. Prepend path variable (uses default separator)
-        let mut env_with_path = LaunchEnv::new(&[], "", "");
+        let mut env_with_path = LaunchEnv::new(std::iter::empty(), "", "");
         env_with_path.set("PATH", "/usr/bin");
         let expected = if cfg!(windows) {
             "/bin;/usr/bin"
@@ -522,7 +522,7 @@ mod tests {
             r"\lifecycle;C:\process;C:\usr\bin".to_string(),
         )];
         // Mixed slash input: forward slash in process_dir and lifecycle_dir
-        let env = LaunchEnv::new(&host_env, "C:/process", "/lifecycle");
+        let env = LaunchEnv::new(host_env, "C:/process", "/lifecycle");
 
         assert_eq!(env.get("PATH").unwrap(), r"C:\usr\bin");
     }
@@ -535,7 +535,7 @@ mod tests {
             "/lifecycle/:/process/:/usr/bin"
         };
         let host_env = vec![("PATH".to_string(), path_val.to_string())];
-        let env = LaunchEnv::new(&host_env, "/process", "/lifecycle");
+        let env = LaunchEnv::new(host_env, "/process", "/lifecycle");
 
         assert_eq!(env.get("PATH").unwrap(), "/usr/bin");
     }

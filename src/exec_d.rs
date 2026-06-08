@@ -319,7 +319,7 @@ echo 'MY_NEW_VAR = "injected_value"' >&3
         perms.set_mode(0o755);
         fs::set_permissions(&script_path, perms).unwrap();
 
-        let env = LaunchEnv::new(&[], "", "");
+        let env = LaunchEnv::new(std::iter::empty(), "", "");
         let res = run_exec_d(&script_path, &env);
 
         assert!(res.is_ok(), "Failed to run exec.d: {:?}", res.err());

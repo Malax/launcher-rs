@@ -354,8 +354,7 @@ fn run_launcher() -> Result<(), LaunchError> {
     })?;
 
     // 8. Prepare Launch Environment
-    let host_envs: Vec<(String, String)> = std::env::vars().collect();
-    let mut env = LaunchEnv::new(&host_envs, CNB_PROCESS_DIR, CNB_LIFECYCLE_DIR);
+    let mut env = LaunchEnv::new(std::env::vars(), CNB_PROCESS_DIR, CNB_LIFECYCLE_DIR);
 
     // Apply layers sequential modifications
     for bp in &metadata.buildpacks {
