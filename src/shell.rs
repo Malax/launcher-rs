@@ -102,7 +102,12 @@ impl Shell for CmdShell {
     }
 }
 
-/// Generates the token-evaluation bash command mimicking Go's `bashCommandWithTokens`.
+/// Generates the shell argument-evaluation bash command, mimicking Go's `bashCommandWithTokens`.
+///
+/// In the upstream Go reference implementation, the command executable and each of its arguments
+/// are referred to as "tokens". This function creates a bash script that evaluates each command token
+/// (positional parameter) individually using `eval echo` to perform shell parameter expansion
+/// while preserving argument boundaries.
 pub fn bash_command_with_tokens(n_tokens: usize) -> String {
     let mut command_script = String::from("\"$(eval echo \\\"$0\\\")\"");
     for i in 1..n_tokens {
