@@ -59,29 +59,22 @@ pub struct RawMetadata {
     pub buildpacks: Vec<RawBuildpack>,
 }
 
-/// A fully resolved, version-agnostic domain process model.
-/// This struct hides all version gates and platform differences behind the boundary parser.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedProcess {
-    /// The process type identifier.
-    pub proc_type: String,
-    /// The resolved absolute path of the executable command.
-    pub command: String,
-    /// The final, fully-resolved argument slice.
-    pub args: Vec<String>,
-    /// The resolved working directory.
-    pub working_directory: String,
-    pub direct: bool,
-}
-
+/// Errors that can occur during the selection and resolution of a CNB application process.
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum ProcessSelectionError {
+    /// No command-line arguments were provided by the user, and no default process type is defined in the metadata.
     NoCommandAndNoDefault,
+    /// The specified process type exists but is ineligible for launch because its execution environment restriction does not match the active environment.
     IneligibleProcess { name: String, exec_env: String },
+    /// The default process type defined in the metadata is ineligible for launch because of execution environment restrictions.
     IneligibleDefault,
+    /// The specified process type is ineligible for launch based on its execution environment restrictions.
     IneligibleProcessSimple { name: String },
+    /// The buildpack metadata associated with the resolved process could not be found.
     BuildpackNotFound { bp_id: String, proc_type: String },
+    /// The resolved process type has an empty command definition.
     EmptyCommand { proc_type: String },
+    /// An error occurred during Buildpack API version verification.
     BuildpackApi(crate::api::buildpack::BuildpackApiError),
 }
 
@@ -139,9 +132,31 @@ impl From<crate::api::buildpack::BuildpackApiError> for ProcessSelectionError {
     }
 }
 
+/// A fully resolved, version-agnostic domain process model.
+/// This struct hides all version gates and platform differences behind the boundary parser.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedProcess {
+    /// The process type identifier.
+    pub proc_type: String,
+    /// The resolved absolute path of the executable command.
+    pub command: String,
+    /// The final, fully-resolved argument slice.
+    pub args: Vec<String>,
+    /// The resolved working directory.
+    pub working_directory: String,
+    pub direct: bool,
+}
+
 impl ResolvedProcess {
     /// Creates a user-provided process definition from raw command-line arguments.
-    pub fn user_provided(cmd: &[String], app_dir: &str) -> Result<Self, ProcessSelectionError> {
+    ///
+    /// This constructor is used when the launcher is invoked with custom arguments
+    /// that do not match any metadata-defined process type. It parses options like
+    /// `--` to determine if the command should be run in direct or indirect execution mode.
+    ///
+    /// Returns a [`ResolvedProcess`] representing the user-specified command and arguments,
+    /// or a [`ProcessSelectionError::NoCommandAndNoDefault`] if the command list is empty.
+    pub fn from_user(cmd: &[String], app_dir: &str) -> Result<Self, ProcessSelectionError> {
         if cmd.is_empty() {
             return Err(ProcessSelectionError::NoCommandAndNoDefault);
         }
@@ -163,6 +178,107 @@ impl ResolvedProcess {
                 direct: false,
             })
         }
+    }
+
+    /// Converts a raw process definition from buildpack metadata into a resolved domain process,
+    /// applying platform API version routing and environment checks.
+    ///
+    /// Returns `Ok(None)` if the process is ineligible for execution in the current environment.
+    pub fn from_metadata(
+        raw: &RawProcess,
+        buildpacks: &[RawBuildpack],
+        platform_api: &Version,
+        exec_env: &str,
+        user_args: &[String],
+    ) -> Result<Option<Self>, ProcessSelectionError> {
+        // 1. Check eligibility (Platform API >= 0.15)
+        if platform_api.at_least("0.15")
+            && raw.exec_env.as_ref().is_some_and(|envs| {
+                !envs.is_empty()
+                    && !envs.contains(&"*".to_string())
+                    && !envs.contains(&exec_env.to_string())
+            })
+        {
+            return Ok(None); // Ineligible
+        }
+
+        // 2. Find buildpack and verify buildpack API
+        let bp_api = if !raw.buildpack_id.is_empty() {
+            let bp = buildpacks
+                .iter()
+                .find(|bp| bp.id == raw.buildpack_id)
+                .ok_or_else(|| ProcessSelectionError::BuildpackNotFound {
+                    bp_id: raw.buildpack_id.clone(),
+                    proc_type: raw.proc_type.clone(),
+                })?;
+            Some(crate::api::buildpack::verify_buildpack_api(
+                &bp.id, &bp.api,
+            )?)
+        } else {
+            None
+        };
+
+        // 3. Resolve command and arguments
+        let entries = match &raw.command {
+            RawCommand::Single(cmd) => vec![cmd.clone()],
+            RawCommand::Array(arr) => arr.clone(),
+        };
+
+        if entries.is_empty() {
+            return Err(ProcessSelectionError::EmptyCommand {
+                proc_type: raw.proc_type.clone(),
+            });
+        }
+
+        let resolved_command = entries[0].clone();
+        let mut resolved_args = Vec::new();
+
+        if platform_api.less_than("0.10") {
+            // Under platform < 0.10, we only support a single command string.
+            // Any overflow entries in RawCommand are pushed to arguments list.
+            resolved_args.extend(entries[1..].iter().cloned());
+            resolved_args.extend(raw.args.clone().unwrap_or_default());
+            resolved_args.extend(user_args.iter().cloned());
+        } else {
+            // Platform >= 0.10
+            if entries.len() > 1 {
+                // Definitely newer buildpack command array
+                resolved_args.extend(entries[1..].iter().cloned()); // always-provided args
+                if !user_args.is_empty() {
+                    resolved_args.extend(user_args.iter().cloned());
+                } else {
+                    resolved_args.extend(raw.args.clone().unwrap_or_default()); // overridable default args
+                }
+            } else {
+                // Single entry command
+                if user_args.is_empty() {
+                    resolved_args.extend(raw.args.clone().unwrap_or_default());
+                } else {
+                    let is_bp_less_than_09 = if let Some(bp_ver) = bp_api {
+                        bp_ver.less_than("0.9")
+                    } else {
+                        false
+                    };
+
+                    if is_bp_less_than_09 {
+                        resolved_args.extend(raw.args.clone().unwrap_or_default());
+                        resolved_args.extend(user_args.iter().cloned());
+                    } else {
+                        resolved_args.extend(user_args.iter().cloned()); // replaces completely
+                    }
+                }
+            }
+        }
+
+        let working_directory = raw.working_dir.clone().unwrap_or_default();
+
+        Ok(Some(Self {
+            proc_type: raw.proc_type.clone(),
+            command: resolved_command,
+            args: resolved_args,
+            working_directory,
+            direct: raw.direct,
+        }))
     }
 
     /// Launches a process directly (without a shell) using Unix process replacement.
@@ -235,15 +351,31 @@ impl ResolvedProcess {
     }
 }
 
+/// A selector responsible for routing command-line arguments and buildpack metadata
+/// to the correct resolved process according to the Cloud Native Buildpacks specification rules.
 pub struct ProcessSelector<'a> {
+    /// The raw command-line arguments passed to the launcher.
     pub args: &'a [String],
+    /// The buildpack processes and buildpacks metadata parsed from the configuration.
     pub metadata: &'a RawMetadata,
+    /// The active Platform API version.
     pub platform_api: &'a crate::api::Version,
+    /// The execution environment identifier (e.g. `"production"`, `"test"`).
     pub exec_env: &'a str,
+    /// The path to the application directory.
     pub app_dir: &'a str,
 }
 
 impl<'a> ProcessSelector<'a> {
+    /// Selects and resolves the process to execute by applying the CNB specification process routing rules:
+    ///
+    /// 1. **Symlink execution:** If `argv0` (the executable name) is not `"launcher"`, find a process type in the metadata matching `argv0`.
+    /// 2. **Default process:** If no user arguments are provided, use the default process type defined in the metadata.
+    /// 3. **Process type match:** If the first user argument matches a process type defined in the metadata, select it and treat any subsequent arguments as process arguments.
+    /// 4. **User-provided command:** If none of the above match, treat the user arguments as a custom command line.
+    ///
+    /// Returns a [`ResolvedProcess`] representing the fully-resolved command, arguments, working directory, and execution mode,
+    /// or a [`ProcessSelectionError`] if selection fails or the chosen process is ineligible.
     pub fn select(self) -> Result<ResolvedProcess, ProcessSelectionError> {
         let argv0 = self.args.first().map(|s| s.as_str()).unwrap_or("launcher");
 
@@ -278,7 +410,7 @@ impl<'a> ProcessSelector<'a> {
         };
 
         let mut resolved = if let Some(raw_proc) = raw_proc_opt {
-            resolve_process(
+            ResolvedProcess::from_metadata(
                 raw_proc,
                 &self.metadata.buildpacks,
                 self.platform_api,
@@ -292,7 +424,7 @@ impl<'a> ProcessSelector<'a> {
         } else if user_args.is_empty() {
             // Rule 2: Default process from metadata
             if let Some(raw_proc) = self.metadata.processes.iter().find(|p| p.default) {
-                resolve_process(
+                ResolvedProcess::from_metadata(
                     raw_proc,
                     &self.metadata.buildpacks,
                     self.platform_api,
@@ -310,7 +442,7 @@ impl<'a> ProcessSelector<'a> {
             .find(|p| p.proc_type == user_args[0])
         {
             // Rule 3: user_args[0] matches a process type (fallback mechanism)
-            resolve_process(
+            ResolvedProcess::from_metadata(
                 raw_proc,
                 &self.metadata.buildpacks,
                 self.platform_api,
@@ -322,7 +454,7 @@ impl<'a> ProcessSelector<'a> {
             })?
         } else {
             // Rule 4: Custom user-provided command
-            return ResolvedProcess::user_provided(&user_args, self.app_dir);
+            return ResolvedProcess::from_user(&user_args, self.app_dir);
         };
 
         if resolved.working_directory.is_empty() {
@@ -332,119 +464,20 @@ impl<'a> ProcessSelector<'a> {
     }
 }
 
-/// Upfront translator/boundary parser. Converts raw process & metadata to a ResolvedProcess.
-/// Returns Ok(None) if the process is filtered out due to exec-env eligibility.
-pub fn resolve_process(
-    raw: &RawProcess,
-    buildpacks: &[RawBuildpack],
-    platform_api: &Version,
-    exec_env: &str,
-    user_args: &[String],
-) -> Result<Option<ResolvedProcess>, ProcessSelectionError> {
-    // 1. Check eligibility (Platform API >= 0.15)
-    if platform_api.at_least("0.15")
-        && raw.exec_env.as_ref().is_some_and(|envs| {
-            !envs.is_empty()
-                && !envs.contains(&"*".to_string())
-                && !envs.contains(&exec_env.to_string())
-        })
-    {
-        return Ok(None); // Ineligible
-    }
-
-    // 2. Find buildpack and verify buildpack API
-    let bp_api = if !raw.buildpack_id.is_empty() {
-        let bp = buildpacks
-            .iter()
-            .find(|bp| bp.id == raw.buildpack_id)
-            .ok_or_else(|| ProcessSelectionError::BuildpackNotFound {
-                bp_id: raw.buildpack_id.clone(),
-                proc_type: raw.proc_type.clone(),
-            })?;
-        Some(crate::api::buildpack::verify_buildpack_api(
-            &bp.id, &bp.api,
-        )?)
-    } else {
-        None
-    };
-
-    // 3. Resolve command and arguments
-    let entries = match &raw.command {
-        RawCommand::Single(cmd) => vec![cmd.clone()],
-        RawCommand::Array(arr) => arr.clone(),
-    };
-
-    if entries.is_empty() {
-        return Err(ProcessSelectionError::EmptyCommand {
-            proc_type: raw.proc_type.clone(),
-        });
-    }
-
-    let resolved_command = entries[0].clone();
-    let mut resolved_args = Vec::new();
-
-    if platform_api.less_than("0.10") {
-        // Under platform < 0.10, we only support a single command string.
-        // Any overflow entries in RawCommand are pushed to arguments list.
-        resolved_args.extend(entries[1..].iter().cloned());
-        resolved_args.extend(raw.args.clone().unwrap_or_default());
-        resolved_args.extend(user_args.iter().cloned());
-    } else {
-        // Platform >= 0.10
-        if entries.len() > 1 {
-            // Definitely newer buildpack command array
-            resolved_args.extend(entries[1..].iter().cloned()); // always-provided args
-            if !user_args.is_empty() {
-                resolved_args.extend(user_args.iter().cloned());
-            } else {
-                resolved_args.extend(raw.args.clone().unwrap_or_default()); // overridable default args
-            }
-        } else {
-            // Single entry command
-            if user_args.is_empty() {
-                resolved_args.extend(raw.args.clone().unwrap_or_default());
-            } else {
-                let is_bp_less_than_09 = if let Some(bp_ver) = bp_api {
-                    bp_ver.less_than("0.9")
-                } else {
-                    false
-                };
-
-                if is_bp_less_than_09 {
-                    resolved_args.extend(raw.args.clone().unwrap_or_default());
-                    resolved_args.extend(user_args.iter().cloned());
-                } else {
-                    resolved_args.extend(user_args.iter().cloned()); // replaces completely
-                }
-            }
-        }
-    }
-
-    let working_directory = raw.working_dir.clone().unwrap_or_default();
-
-    Ok(Some(ResolvedProcess {
-        proc_type: raw.proc_type.clone(),
-        command: resolved_command,
-        args: resolved_args,
-        working_directory,
-        direct: raw.direct,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_user_provided_process_selection() {
+    fn test_from_user_process_selection() {
         let cmd_direct = vec!["--".to_string(), "node".to_string(), "index.js".to_string()];
-        let proc_direct = ResolvedProcess::user_provided(&cmd_direct, "/workspace").unwrap();
+        let proc_direct = ResolvedProcess::from_user(&cmd_direct, "/workspace").unwrap();
         assert!(proc_direct.direct);
         assert_eq!(proc_direct.command, "node");
         assert_eq!(proc_direct.args, vec!["index.js".to_string()]);
 
         let cmd_indirect = vec!["node".to_string(), "index.js".to_string()];
-        let proc_indirect = ResolvedProcess::user_provided(&cmd_indirect, "/workspace").unwrap();
+        let proc_indirect = ResolvedProcess::from_user(&cmd_indirect, "/workspace").unwrap();
         assert!(!proc_indirect.direct);
         assert_eq!(proc_indirect.command, "node");
         assert_eq!(proc_indirect.args, vec!["index.js".to_string()]);
@@ -470,15 +503,17 @@ mod tests {
 
         // 1. Eligibility test (Platform >= 0.15)
         let plat_15 = Version::new(0, 15);
-        let res_eligible = resolve_process(&raw, &buildpacks, &plat_15, "production", &[]);
+        let res_eligible =
+            ResolvedProcess::from_metadata(&raw, &buildpacks, &plat_15, "production", &[]);
         assert!(res_eligible.unwrap().is_some());
 
-        let res_ineligible = resolve_process(&raw, &buildpacks, &plat_15, "test", &[]);
+        let res_ineligible =
+            ResolvedProcess::from_metadata(&raw, &buildpacks, &plat_15, "test", &[]);
         assert!(res_ineligible.unwrap().is_none());
 
         // 2. Command separation test (Platform < 0.10 vs >= 0.10)
         let plat_9 = Version::new(0, 9);
-        let res_p9 = resolve_process(&raw, &buildpacks, &plat_9, "production", &[])
+        let res_p9 = ResolvedProcess::from_metadata(&raw, &buildpacks, &plat_9, "production", &[])
             .unwrap()
             .unwrap();
         // under plat < 0.10, entries[1..] is prepended to args
@@ -486,9 +521,10 @@ mod tests {
         assert_eq!(res_p9.args, vec!["server.js", "--port", "8080"]);
 
         let plat_10 = Version::new(0, 10);
-        let res_p10 = resolve_process(&raw, &buildpacks, &plat_10, "production", &[])
-            .unwrap()
-            .unwrap();
+        let res_p10 =
+            ResolvedProcess::from_metadata(&raw, &buildpacks, &plat_10, "production", &[])
+                .unwrap()
+                .unwrap();
         assert_eq!(res_p10.command, "node");
         // under plat >= 0.10, entries[1..] are always-provided, args are defaults (and since user_args is empty, they are appended)
         assert_eq!(res_p10.args, vec!["server.js", "--port", "8080"]);
@@ -513,7 +549,7 @@ mod tests {
             api: "0.8".to_string(),
         }];
         let plat = Version::new(0, 10);
-        let res_old = resolve_process(
+        let res_old = ResolvedProcess::from_metadata(
             &raw,
             &bps_old,
             &plat,
@@ -529,7 +565,7 @@ mod tests {
             id: "my-bp".to_string(),
             api: "0.9".to_string(),
         }];
-        let res_new = resolve_process(
+        let res_new = ResolvedProcess::from_metadata(
             &raw,
             &bps_new,
             &plat,
@@ -585,41 +621,41 @@ mod tests {
 
         // No exec-env -> matches any
         assert!(
-            resolve_process(&raw_no_env, &buildpacks, &plat_15, "test", &[])
+            ResolvedProcess::from_metadata(&raw_no_env, &buildpacks, &plat_15, "test", &[])
                 .unwrap()
                 .is_some()
         );
         assert!(
-            resolve_process(&raw_no_env, &buildpacks, &plat_15, "", &[])
+            ResolvedProcess::from_metadata(&raw_no_env, &buildpacks, &plat_15, "", &[])
                 .unwrap()
                 .is_some()
         );
 
         // Wildcard '*' -> matches any
         assert!(
-            resolve_process(&raw_wildcard, &buildpacks, &plat_15, "test", &[])
+            ResolvedProcess::from_metadata(&raw_wildcard, &buildpacks, &plat_15, "test", &[])
                 .unwrap()
                 .is_some()
         );
         assert!(
-            resolve_process(&raw_wildcard, &buildpacks, &plat_15, "", &[])
+            ResolvedProcess::from_metadata(&raw_wildcard, &buildpacks, &plat_15, "", &[])
                 .unwrap()
                 .is_some()
         );
 
         // Specific 'production' -> matches production, fails on test/empty
         assert!(
-            resolve_process(&raw_prod, &buildpacks, &plat_15, "production", &[])
+            ResolvedProcess::from_metadata(&raw_prod, &buildpacks, &plat_15, "production", &[])
                 .unwrap()
                 .is_some()
         );
         assert!(
-            resolve_process(&raw_prod, &buildpacks, &plat_15, "test", &[])
+            ResolvedProcess::from_metadata(&raw_prod, &buildpacks, &plat_15, "test", &[])
                 .unwrap()
                 .is_none()
         );
         assert!(
-            resolve_process(&raw_prod, &buildpacks, &plat_15, "", &[])
+            ResolvedProcess::from_metadata(&raw_prod, &buildpacks, &plat_15, "", &[])
                 .unwrap()
                 .is_none()
         );
