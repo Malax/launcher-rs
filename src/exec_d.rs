@@ -199,6 +199,8 @@ mod win32 {
     pub type BOOL = i32;
     pub type DWORD = u32;
 
+    pub const HANDLE_FLAG_INHERIT: DWORD = 0x00000001;
+
     #[repr(C)]
     pub struct SECURITY_ATTRIBUTES {
         pub nLength: DWORD,
@@ -213,6 +215,7 @@ mod win32 {
             lpPipeAttributes: *mut SECURITY_ATTRIBUTES,
             nSize: DWORD,
         ) -> BOOL;
+        pub fn SetHandleInformation(hObject: HANDLE, dwMask: DWORD, dwFlags: DWORD) -> BOOL;
     }
 }
 
@@ -241,6 +244,13 @@ pub fn run_exec_d<P: AsRef<Path>>(
     if res == 0 {
         return Err(ExecDError::CreatePipe(
             "Failed to create Win32 pipe".to_string(),
+        ));
+    }
+
+    // Disable read handle inheritance so only the write handle is inherited by the child
+    if unsafe { win32::SetHandleInformation(read_handle, win32::HANDLE_FLAG_INHERIT, 0) } == 0 {
+        return Err(ExecDError::CreatePipe(
+            "Failed to configure pipe handle inheritance".to_string(),
         ));
     }
 
