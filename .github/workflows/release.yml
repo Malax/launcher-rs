@@ -18,12 +18,16 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            suffix: linux.x86-64
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
+            suffix: linux.arm64
           - target: s390x-unknown-linux-gnu
             os: ubuntu-latest
+            suffix: linux.s390x
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            suffix: windows.x86-64
     steps:
       - uses: actions/checkout@v5
 
@@ -55,12 +59,12 @@ jobs:
           syft dist/launcher -o json=dist/launcher.sbom.syft.json
           syft dist/launcher -o spdx-json=dist/launcher.sbom.spdx.json
           syft dist/launcher -o cyclonedx-json=dist/launcher.sbom.cdx.json
-          tar -C dist -czf launcher-${{ matrix.target }}.tgz \
+          tar -C dist -czf launcher-${{ github.ref_name }}+${{ matrix.suffix }}.tgz \
             launcher \
             launcher.sbom.syft.json \
             launcher.sbom.spdx.json \
             launcher.sbom.cdx.json
-          sha256sum launcher-${{ matrix.target }}.tgz > launcher-${{ matrix.target }}.tgz.sha256
+          sha256sum launcher-${{ github.ref_name }}+${{ matrix.suffix }}.tgz > launcher-${{ github.ref_name }}+${{ matrix.suffix }}.tgz.sha256
 
       - name: Package Zip (Windows)
         if: matrix.os == 'windows-latest'
@@ -71,16 +75,16 @@ jobs:
           syft dist\launcher.exe -o json=dist\launcher.sbom.syft.json
           syft dist\launcher.exe -o spdx-json=dist\launcher.sbom.spdx.json
           syft dist\launcher.exe -o cyclonedx-json=dist\launcher.sbom.cdx.json
-          Compress-Archive -Path dist\launcher.exe, dist\launcher.sbom.syft.json, dist\launcher.sbom.spdx.json, dist\launcher.sbom.cdx.json -DestinationPath launcher-${{ matrix.target }}.zip -Force
-          $sha = (Get-FileHash -Path launcher-${{ matrix.target }}.zip -Algorithm SHA256).Hash.ToLower()
-          "$sha  launcher-${{ matrix.target }}.zip" | Out-File -FilePath launcher-${{ matrix.target }}.zip.sha256 -Encoding ascii
+          Compress-Archive -Path dist\launcher.exe, dist\launcher.sbom.syft.json, dist\launcher.sbom.spdx.json, dist\launcher.sbom.cdx.json -DestinationPath launcher-${{ github.ref_name }}+${{ matrix.suffix }}.zip -Force
+          $sha = (Get-FileHash -Path launcher-${{ github.ref_name }}+${{ matrix.suffix }}.zip -Algorithm SHA256).Hash.ToLower()
+          "$sha  launcher-${{ github.ref_name }}+${{ matrix.suffix }}.zip" | Out-File -FilePath launcher-${{ github.ref_name }}+${{ matrix.suffix }}.zip.sha256 -Encoding ascii
 
       - name: Upload Binary Package
         uses: actions/upload-artifact@v4
         with:
-          name: launcher-${{ matrix.target }}
+          name: launcher-${{ matrix.suffix }}
           path: |
-            launcher-${{ matrix.target }}.*
+            launcher-${{ github.ref_name }}+${{ matrix.suffix }}.*
 
   sbom:
     name: Generate Source SBOM
