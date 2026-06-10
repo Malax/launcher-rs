@@ -272,13 +272,7 @@ impl LaunchEnv {
                 }
             }
             ActionType::Prepend => {
-                let d = delim.unwrap_or_else(|| {
-                    if name == "PATH" || name == "LD_LIBRARY_PATH" {
-                        if cfg!(windows) { ";" } else { ":" }
-                    } else {
-                        ""
-                    }
-                });
+                let d = delim.unwrap_or("");
                 match self.vars.get(name) {
                     Some(current) if !current.is_empty() => Some(format!("{}{}{}", v, d, current)),
                     _ => Some(v),
@@ -387,12 +381,8 @@ mod tests {
 
         env.add_env_dir(dir_path, ActionType::Override).unwrap();
 
-        // PATH uses default separator (":" on unix, ";" on windows)
-        let expected_path = if cfg!(windows) {
-            "/layer/bin;/usr/bin"
-        } else {
-            "/layer/bin:/usr/bin"
-        };
+        // PATH prepends without separator unless .delim specifies one
+        let expected_path = "/layer/bin/usr/bin";
         assert_eq!(env.get("PATH").unwrap(), expected_path);
         // VAR uses custom delimiter "-"
         assert_eq!(env.get("VAR").unwrap(), "base-appendage");
@@ -495,14 +485,10 @@ mod tests {
             Some("val1-val3".to_string())
         );
 
-        // 5. Prepend path variable (uses default separator)
+        // 5. Prepend path variable (uses no separator without .delim)
         let mut env_with_path = LaunchEnv::new(std::iter::empty(), "", "");
         env_with_path.set("PATH", "/usr/bin");
-        let expected = if cfg!(windows) {
-            "/bin;/usr/bin"
-        } else {
-            "/bin:/usr/bin"
-        };
+        let expected = "/bin/usr/bin";
         assert_eq!(
             env_with_path.evaluate_env_modifier(
                 "PATH",

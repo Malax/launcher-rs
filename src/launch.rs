@@ -425,14 +425,11 @@ impl<'a> ProcessSelector<'a> {
         };
 
         // Rule 1: argv0 matches a process type (e.g. symlink)
-        let raw_proc_opt = if process_name != "launcher" {
-            self.metadata
-                .processes
-                .iter()
-                .find(|p| p.proc_type == process_name)
-        } else {
-            None
-        };
+        let raw_proc_opt = self
+            .metadata
+            .processes
+            .iter()
+            .find(|p| p.proc_type == process_name);
 
         let mut resolved = if let Some(raw_proc) = raw_proc_opt {
             ResolvedProcess::from_metadata(
@@ -447,38 +444,9 @@ impl<'a> ProcessSelector<'a> {
                 exec_env: self.exec_env.to_string(),
             })?
         } else if user_args.is_empty() {
-            // Rule 2: Default process from metadata
-            if let Some(raw_proc) = self.metadata.processes.iter().find(|p| p.default) {
-                ResolvedProcess::from_metadata(
-                    raw_proc,
-                    &self.metadata.buildpacks,
-                    self.platform_api,
-                    self.exec_env,
-                    &[],
-                )?
-                .ok_or(ProcessSelectionError::IneligibleDefault)?
-            } else {
-                return Err(ProcessSelectionError::NoCommandAndNoDefault);
-            }
-        } else if let Some(raw_proc) = self
-            .metadata
-            .processes
-            .iter()
-            .find(|p| p.proc_type == user_args[0])
-        {
-            // Rule 3: user_args[0] matches a process type (fallback mechanism)
-            ResolvedProcess::from_metadata(
-                raw_proc,
-                &self.metadata.buildpacks,
-                self.platform_api,
-                self.exec_env,
-                &user_args[1..],
-            )?
-            .ok_or_else(|| ProcessSelectionError::IneligibleProcessSimple {
-                name: user_args[0].clone(),
-            })?
+            return Err(ProcessSelectionError::NoCommandAndNoDefault);
         } else {
-            // Rule 4: Custom user-provided command
+            // Rule 2: Custom user-provided command
             return ResolvedProcess::from_user(user_args, self.app_dir);
         };
 
@@ -744,26 +712,10 @@ mod tests {
             exec_env: "test",
             app_dir: "/workspace",
         };
-        let res = selector.select().unwrap();
-        assert_eq!(res.proc_type, "web"); // web is default
-        assert_eq!(res.working_directory, "/workspace");
+        let err = selector.select().unwrap_err();
+        assert!(matches!(err, ProcessSelectionError::NoCommandAndNoDefault));
 
-        // Rule 3: user_args[0] matches process type
-        let selector = ProcessSelector {
-            args: &[
-                "launcher".to_string(),
-                "worker".to_string(), // user args[0]
-            ],
-            metadata: &metadata,
-            platform_api: &platform_api,
-            exec_env: "test",
-            app_dir: "/workspace",
-        };
-        let res = selector.select().unwrap();
-        assert_eq!(res.proc_type, "worker");
-        assert_eq!(res.working_directory, "/workspace");
-
-        // Rule 4: Custom user-provided command
+        // Rule 2: Custom user-provided command
         let selector = ProcessSelector {
             args: &[
                 "launcher".to_string(),

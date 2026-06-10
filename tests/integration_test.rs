@@ -264,7 +264,9 @@ api = "0.12"
     let app_profile = app_path.join(".profile");
     fs::write(&app_profile, "export APP_ENV=\"sourced-app-val\"\n").unwrap();
 
+    use std::os::unix::process::CommandExt;
     let mut cmd = Command::new(&launcher_bin);
+    cmd.arg0("worker");
     cmd.env("CNB_PLATFORM_API", "0.15");
     cmd.env("CNB_LAYERS_DIR", layers_path.to_string_lossy().to_string());
     cmd.env("CNB_APP_DIR", app_path.to_string_lossy().to_string());
