@@ -59,7 +59,9 @@ pub enum ExecDError {
         status: std::process::ExitStatus,
     },
     /// Failed to parse the TOML map returned by the binary.
-    #[error("Failed to decode TOML output from exec.d binary '{path}': {error}\nOutput: '{output}'")]
+    #[error(
+        "Failed to decode TOML output from exec.d binary '{path}': {error}\nOutput: '{output}'"
+    )]
     Decode {
         /// The path of the binary.
         path: String,
